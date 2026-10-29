@@ -1,0 +1,38 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "ポートフォリオΔ",
+      "hasCanvas": false,
+      "bodyTextLen": 268,
+      "bodyTextHash": "70fd16be62c110fd6b5a6fd72be3638952eb36442819df39d13abe4e284a4cff",
+      "bodyTextPrefix": "フォルダ 作成 コピーフォルダ貼りつけ すべての画像 0 ファイル一覧 このフォルダにファイルはありません タブ 1 2 3 昇",
+      "horizontalOverflow": false,
+      "consoleErrors": [
+        "A tree hydrated but some attributes of the server rendered HTML didn't match the client properties. This won't be patched up. This can happen if a SSR-ed Client Component used:\n\n- A server/client branch `if (typeof window !== 'undefined')`.\n- Variable input such as `Date.now()` or `Math.random()` which changes each time it's called.\n- Date formatting in a user's locale which doesn't match the server.\n- External changing data without sending a snapshot of it along with the HTML.\n- Invalid HTML tag nesting.\n\nIt can also happen if the client has a browser extension installed which messes with the HTML before React loaded.\n\n%s%s https://react.dev/link/hydration-mismatch \n\n  ...\n    <html lang=\"ja\" className=\"antialiased\" suppressHydrationWarning={true}>\n      <head>\n      <body>\n        <PreviewHostBridge>\n        <AuthProvider>\n          <OutletImpl>\n            <Suspense fallback={null}>\n              <MatchImpl routeId=\"/\">\n                <MatchView router={{...}} match={{id:\"//\",ssr:true, ...}}>\n                  <CatchBoundary getResetKey={function getResetKey} errorComponent={function AppErrorComponent} ...>\n                    <MatchInnerImpl match={{id:\"//\",ssr:true, ...}}>\n                      <Lazy>\n                        <Home>\n                          <PortfolioScreen>\n                            <div className=\"library-shell\" style={{...}} onDragEnter={function onShellDragEnter} ...>\n                              <FolderRail>\n                              <div>\n                              ...\n                                <div className=\"tool-stack\">\n                                  <div>\n                                  <div className=\"tool-row t...\">\n                                    <BackupActions ref={{current:null}} disabled={true} viewer={false} tab={1}>\n                                      <Button>\n                                      <Button>\n                                      <input\n                                        ref={{current:null}}\n                                        type=\"file\"\n                                        accept=\".kmb,application/octet-stream\"\n                                        className=\"sr-only\"\n                                        aria-label=\"バックアップファイル\"\n                                        onChange={function onChange}\n-                                       style={{caret-color:\"transparent\"}}\n                                      >\n                                      ...\n                                    ...\n                              <div>\n                              <TagRail>\n                              <input\n                                ref={{current:null}}\n                                className=\"sr-only\"\n                                type=\"file\"\n                                accept=\"image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm\"\n                                multiple={true}\n                                aria-label=\"画像を取り込む\"\n                                onChange={function onChange}\n-                               style={{caret-color:\"transparent\"}}\n                              >\n                              ...\n        ...\n"
+      ],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "ポートフォリオΔ",
+      "hasCanvas": false,
+      "bodyTextLen": 217,
+      "bodyTextHash": "12f343ec8809325c3df14d48c24e3b23fba91805ed5222301572ea91c14727e3",
+      "bodyTextPrefix": "フォルダ 作成 コピーフォルダ貼りつけ すべての画像 0 ファイル一覧 このフォルダにファイルはありません タブ 昇順 降順 拡",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-preview.json"
+}
