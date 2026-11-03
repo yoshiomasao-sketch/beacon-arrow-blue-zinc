@@ -153,6 +153,7 @@ export function normalizeMeta(raw: unknown): ImageMeta | null {
       : [],
     animated: row.animated === true,
     memo: normalizeMemo(row.memo),
+    inkVisible: row.inkVisible === false ? false : true,
   };
 }
 
@@ -317,6 +318,27 @@ export function assignVisibleOrders<T extends { id: string; order: number }>(
     const order = nextOrder.get(item.id);
     return order === undefined ? item : { ...item, order };
   });
+}
+
+/** Unbiased Fisher–Yates. The input list is not changed. */
+export function shuffleIds(ids: readonly string[], random: () => number = Math.random): string[] {
+  const next = ids.slice();
+  for (let index = next.length - 1; index > 0; index -= 1) {
+    const swap = Math.floor(random() * (index + 1));
+    const current = next[index]!;
+    next[index] = next[swap]!;
+    next[swap] = current;
+  }
+  return next;
+}
+
+/** Newest registration first. Missing or non-positive addedAt stays unknown and follows the dated images. */
+export function addedDateOrder<T extends { id: string; addedAt: number }>(items: readonly T[]): string[] {
+  const ranked = items.map((item, index) => ({ item, index }));
+  const known = ranked.filter((entry) => Number.isFinite(entry.item.addedAt) && entry.item.addedAt > 0);
+  const unknown = ranked.filter((entry) => !known.includes(entry));
+  known.sort((a, b) => b.item.addedAt - a.item.addedAt || a.index - b.index);
+  return [...known, ...unknown].map((entry) => entry.item.id);
 }
 
 export function folderOrderAfterMove(ids: string[], sourceId: string, beforeId: string | null): string[] | null {

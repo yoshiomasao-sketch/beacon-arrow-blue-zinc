@@ -4,6 +4,8 @@ import { shotAfterFailure, shotRetryDelay } from "./shot-load.ts";
 import {
   baseName,
   assignVisibleOrders,
+  shuffleIds,
+  addedDateOrder,
   boxesInRect,
   classifyImageInput,
   exportFileName,
@@ -324,6 +326,7 @@ describe("normalizeMeta", () => {
     assert.equal(meta?.folderId, "");
     assert.equal(meta?.favorite, false);
     assert.equal(meta?.memo, "");
+    assert.equal(meta?.inkVisible, true);
     assert.deepEqual(meta?.tagIds, []);
     assert.equal(
       normalizeMeta({
@@ -341,6 +344,14 @@ describe("normalizeMeta", () => {
         memo: "  夕景の空  ",
       })?.memo,
       "夕景の空",
+    );
+    assert.equal(
+      normalizeMeta({
+        id: "a",
+        mime: "image/png",
+        inkVisible: false,
+      })?.inkVisible,
+      false,
     );
     assert.equal(commitMemo("", ""), "cancel");
     assert.equal(commitMemo("", "   "), "cancel");
@@ -703,6 +714,80 @@ describe("assignVisibleOrders", () => {
       { id: "a2", order: 1 },
       { id: "b2", order: 4 },
     ]);
+  });
+});
+
+describe("shuffleIds", () => {
+  it("keeps every id once and follows Fisher-Yates swaps", () => {
+    const draws = [0, 0, 0];
+    let call = 0;
+    const shuffled = shuffleIds(["a", "b", "c", "d"], () => draws[call++] ?? 0);
+    assert.deepEqual(shuffled, ["b", "c", "d", "a"]);
+    assert.deepEqual(["a", "b", "c", "d"].sort(), shuffled.slice().sort());
+  });
+
+  it("reorders only the visible images, including when the list is newest-first", () => {
+    const items = [
+      { id: "shown-a", order: 1, folderId: "here", addedAt: 1 },
+      { id: "other", order: 2, folderId: "away", addedAt: 2 },
+      { id: "shown-b", order: 3, folderId: "here", addedAt: 3 },
+      { id: "hidden", order: 4, folderId: "here", addedAt: 4 },
+      { id: "shown-c", order: 5, folderId: "here", addedAt: 5 },
+    ];
+    const visual = ["shown-a", "shown-c", "shown-b"];
+    const stored = visual.slice().reverse();
+    const next = assignVisibleOrders(items, stored);
+    assert.deepEqual(
+      readingSequence(
+        (next ?? []).filter((item) => visual.includes(item.id)),
+        "desc",
+      ).map((item) => item.id),
+      visual,
+    );
+    assert.equal(next?.find((item) => item.id === "other")?.order, 2);
+    assert.equal(next?.find((item) => item.id === "hidden")?.order, 4);
+    assert.deepEqual(
+      next?.map((item) => item.folderId),
+      ["here", "away", "here", "here", "here"],
+    );
+  });
+});
+
+describe("addedDateOrder", () => {
+  it("sorts known registration times newest first and leaves unknown dates after them", () => {
+    const visual = [
+      { id: "new", addedAt: 300 },
+      { id: "unknown", addedAt: 0 },
+      { id: "old", addedAt: 100 },
+      { id: "blank", addedAt: Number.NaN },
+      { id: "mid", addedAt: 200 },
+    ];
+    assert.deepEqual(addedDateOrder(visual), ["new", "mid", "old", "unknown", "blank"]);
+  });
+
+  it("reorders only the visible images and does not invent a date for an unknown one", () => {
+    const items = [
+      { id: "shown-new", order: 1, addedAt: 50, folderId: "here" },
+      { id: "other", order: 2, addedAt: 1, folderId: "away" },
+      { id: "shown-old", order: 3, addedAt: 10, folderId: "here" },
+      { id: "hidden", order: 4, addedAt: 5, folderId: "here" },
+      { id: "shown-unknown", order: 5, addedAt: 0, folderId: "here" },
+    ];
+    const visible = [items[0]!, items[2]!, items[4]!];
+    const visual = addedDateOrder(visible);
+    const stored = visual.slice().reverse();
+    const next = assignVisibleOrders(items, stored);
+    assert.deepEqual(visual, ["shown-new", "shown-old", "shown-unknown"]);
+    assert.deepEqual(
+      readingSequence(
+        (next ?? []).filter((item) => visual.includes(item.id)),
+        "desc",
+      ).map((item) => item.id),
+      visual,
+    );
+    assert.equal(next?.find((item) => item.id === "other")?.order, 2);
+    assert.equal(next?.find((item) => item.id === "hidden")?.order, 4);
+    assert.equal(next?.find((item) => item.id === "shown-unknown")?.addedAt, 0);
   });
 });
 

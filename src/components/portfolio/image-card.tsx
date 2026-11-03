@@ -1,13 +1,90 @@
-import { Check, Heart, Pencil, Trash2 } from "lucide-react";
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { readPixels } from "@/lib/portfolio/db";
-import { commitMemo, type FlowBox } from "@/lib/portfolio/logic";
+import { Check, Eye, EyeOff, Heart, Pencil, Trash2 } from "lucide-react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { createPortal } from "react-dom";
+import { readInk, readPixels } from "@/lib/portfolio/db";
+import { cachedOriginal, primeOriginal, writeOriginalDrag } from "@/lib/portfolio/export-file";
+import { type FlowBox } from "@/lib/portfolio/logic";
 import { SHOT_TIMEOUT_MS, shotAfterFailure, shotRetryDelay } from "@/lib/portfolio/shot-load";
 import { invalidateThumb, loadThumb, peekThumb, pinThumb } from "@/lib/portfolio/thumbs";
 import { TAG_DRAG, type ImageMeta, type Tag } from "@/lib/portfolio/types";
 import { currentTagDrag, eventIsTagDrag } from "@/lib/portfolio/tag-drag";
+import { setInkVisible, usePortfolio } from "@/lib/portfolio/store";
+import { placeSpot } from "@/components/portfolio/spot-confirm";
 
 const DRAG_SLOP = 6;
+
+function stylusPointer(type: string): boolean {
+  return type === "pen" || type === "touch";
+}
+
+function hasBytes(bytes: Uint8Array, needle: number[]): boolean {
+  outer: for (let index = 0; index <= bytes.length - needle.length; index += 1) {
+    for (let offset = 0; offset < needle.length; offset += 1) {
+      if (bytes[index + offset] !== needle[offset]) continue outer;
+    }
+    return true;
+  }
+  return false;
+}
+
+async function isStaticPoster(blob: Blob): Promise<boolean> {
+  if (blob.type === "image/jpeg") return true;
+  if (blob.type !== "image/png") return false;
+  const bytes = new Uint8Array(await blob.slice(0, 2048).arrayBuffer());
+  return !hasBytes(bytes, [0x61, 0x63, 0x54, 0x4c]);
+}
+
+async function stillFrame(blob: Blob): Promise<Blob | null> {
+  if (blob.type.startsWith("video/")) return videoPoster(blob);
+  let bitmap: ImageBitmap | null = null;
+  try {
+    bitmap = await createImageBitmap(blob);
+    if (bitmap.width < 1 || bitmap.height < 1) return null;
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(bitmap, 0, 0);
+    return await new Promise((resolve) => canvas.toBlob((next) => resolve(next), "image/png"));
+  } catch {
+    return null;
+  } finally {
+    bitmap?.close();
+  }
+}
+
+function videoPoster(blob: Blob): Promise<Blob | null> {
+  const url = URL.createObjectURL(blob);
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = "auto";
+  video.src = url;
+  return new Promise((resolve) => {
+    const finish = (next: Blob | null) => {
+      URL.revokeObjectURL(url);
+      resolve(next);
+    };
+    video.onerror = () => finish(null);
+    video.onloadeddata = () => {
+      if (video.videoWidth < 1 || video.videoHeight < 1) {
+        finish(null);
+        return;
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        finish(null);
+        return;
+      }
+      ctx.drawImage(video, 0, 0);
+      canvas.toBlob((next) => finish(next), "image/jpeg", 0.82);
+    };
+  });
+}
 
 function menuFit(width: number, height: number): "full" | "compact" | "tiny" {
   if (width < 96 || height < 72) return "tiny";
@@ -49,8 +126,165 @@ function ShotName({ name, active, className = "" }: { name: string; active: bool
   );
 }
 
+function placedMedia(boxW: number, boxH: number, imageW: number, imageH: number): CSSProperties {
+  const widthBudget = Math.max(0, boxW);
+  const heightBudget = Math.max(0, boxH);
+  const sourceW = Math.max(1, imageW);
+  const sourceH = Math.max(1, imageH);
+  const scale = Math.min(widthBudget / sourceW, heightBudget / sourceH);
+  const width = sourceW * scale;
+  const height = sourceH * scale;
+  return {
+    left: (widthBudget - width) / 2,
+    top: (heightBudget - height) / 2,
+    width,
+    height,
+    right: "auto",
+    bottom: "auto",
+  };
+}
 function isTagDrag(event: React.DragEvent): boolean {
   return eventIsTagDrag(event.dataTransfer.types);
+}
+
+const inkPreviewCache = new Map<string, { rev: number; url: string }>();
+
+function cachedInkPreview(id: string, rev: number): string | null {
+  const hit = inkPreviewCache.get(id);
+  return hit && hit.rev === rev ? hit.url : null;
+}
+
+function rememberInkPreview(id: string, rev: number, url: string): void {
+  const hit = inkPreviewCache.get(id);
+  if (hit && hit.rev > rev) {
+    URL.revokeObjectURL(url);
+    return;
+  }
+  if (hit && hit.url !== url) URL.revokeObjectURL(hit.url);
+  inkPreviewCache.set(id, { rev, url });
+}
+
+async function shrinkInk(blob: Blob): Promise<Blob> {
+  const bitmap = await createImageBitmap(blob);
+  try {
+    const maxEdge = 480;
+    const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height));
+    if (scale >= 0.999) return blob;
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    canvas.getContext("2d")?.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const preview = await new Promise<Blob | null>((resolve) => canvas.toBlob((next) => resolve(next), "image/png"));
+    return preview && preview.size > 0 ? preview : blob;
+  } finally {
+    bitmap.close();
+  }
+}
+
+function InkStill({ imageId, revision, style }: { imageId: string; revision: number; style: CSSProperties }) {
+  const [url, setUrl] = useState<string | null>(() => cachedInkPreview(imageId, revision));
+  useEffect(() => {
+    const cached = cachedInkPreview(imageId, revision);
+    if (cached) {
+      setUrl(cached);
+      return;
+    }
+    let alive = true;
+    void readInk(imageId)
+      .then(async (blob) => {
+        if (!alive || !blob) {
+          if (alive) setUrl(null);
+          return;
+        }
+        const preview = await shrinkInk(blob).catch(() => blob);
+        if (!alive) return;
+        const next = URL.createObjectURL(preview);
+        rememberInkPreview(imageId, revision, next);
+        if (alive) setUrl(cachedInkPreview(imageId, revision));
+      })
+      .catch(() => {
+        if (alive) setUrl(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [imageId, revision]);
+  if (!url) return null;
+  return <img className="shot-ink" src={url} alt="" draggable={false} style={style} />;
+}
+
+function ShotDeleteAsk({
+  anchor,
+  trigger,
+  body,
+  onConfirm,
+  onCancel,
+}: {
+  anchor: DOMRect;
+  trigger: HTMLElement | null;
+  body: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState(() => placeSpot(anchor, "below", { width: 220, height: 92 }));
+
+  useLayoutEffect(() => {
+    const node = ref.current;
+    if (!node) return;
+    const box = node.getBoundingClientRect();
+    const next = placeSpot(anchor, "below", { width: box.width, height: box.height });
+    setPos((current) => (current.top === next.top && current.left === next.left ? current : next));
+  }, [anchor, body]);
+
+  useEffect(() => {
+    const onPointer = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (ref.current?.contains(target)) return;
+      if (trigger && trigger.contains(target)) event.preventDefault();
+      onCancel();
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onCancel();
+    };
+    const onScroll = (event: Event) => {
+      const target = event.target;
+      if (target instanceof Node && ref.current?.contains(target)) return;
+      onCancel();
+    };
+    document.addEventListener("pointerdown", onPointer, true);
+    document.addEventListener("keydown", onKey);
+    window.addEventListener("scroll", onScroll, true);
+    return () => {
+      document.removeEventListener("pointerdown", onPointer, true);
+      document.removeEventListener("keydown", onKey);
+      window.removeEventListener("scroll", onScroll, true);
+    };
+  }, [onCancel, trigger]);
+
+  if (typeof document === "undefined") return null;
+
+  return createPortal(
+    <div
+      ref={ref}
+      className="spot-confirm"
+      role="dialog"
+      aria-label="画像を削除"
+      style={{ top: pos.top, left: pos.left }}
+    >
+      <p>{body}</p>
+      <div className="spot-confirm-actions">
+        <button type="button" onClick={onCancel}>
+          キャンセル
+        </button>
+        <button type="button" className="spot-go" onClick={onConfirm}>
+          削除
+        </button>
+      </div>
+    </div>,
+    document.body,
+  );
 }
 
 export function ImageCard({
@@ -60,7 +294,9 @@ export function ImageCard({
   dragging,
   insertEdge,
   onOpen,
+  onInk,
   onDragStart,
+  onExternalDrag,
   flash,
   fading,
   origin = "",
@@ -69,10 +305,10 @@ export function ImageCard({
   onToggleSelect,
   onFavorite,
   onDelete,
-  onMemo,
   onAssignTag,
   onTagPrompt,
   viewer = false,
+  gifMotion = true,
 }: {
   item: ImageMeta;
   box: FlowBox;
@@ -80,7 +316,9 @@ export function ImageCard({
   dragging: boolean;
   insertEdge: "before" | "after" | null;
   onOpen: (id: string) => void;
+  onInk: (id: string) => void;
   onDragStart: (id: string, event: PointerEvent) => void;
+  onExternalDrag: (id: string, point: { x: number; y: number }) => void;
   flash: boolean;
   fading: boolean;
   origin?: string;
@@ -93,6 +331,7 @@ export function ImageCard({
   onAssignTag: (id: string, tagId: string) => void;
   onTagPrompt: (imageId: string, tagId: string, rect: DOMRect) => void;
   viewer?: boolean;
+  gifMotion?: boolean;
 }) {
   const frameRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLLIElement>(null);
@@ -102,16 +341,24 @@ export function ImageCard({
     failed: () => void;
   } | null>(null);
   const suppressClick = useRef(false);
-  const memoRef = useRef<HTMLFormElement>(null);
-  const [memoOpen, setMemoOpen] = useState(false);
-  const [draft, setDraft] = useState("");
-  const pixelKey = item.animated ? `${item.id}:motion` : item.id;
+  const nativeDrag = useRef(false);
+  const pointerOwned = useRef(false);
+  const gestureKind = useRef("mouse");
+  const gesturePointer = useRef<number | null>(null);
+  const slopCleanup = useRef<(() => void) | null>(null);
+  const pauseMotion = item.animated && !gifMotion;
+  const pixelKey = pauseMotion ? `${item.id}:still` : item.animated ? `${item.id}:motion` : item.id;
+  const hasInk = usePortfolio((state) => state.inkIds.includes(item.id));
+  const inkRev = usePortfolio((state) => state.inkRev[item.id] ?? 0);
+  const inkShown = item.inkVisible !== false;
   const [url, setUrl] = useState<string | null>(() => peekThumb(pixelKey));
   const [status, setStatus] = useState<"loading" | "ready" | "missing" | "error">("loading");
   const [retryNonce, setRetryNonce] = useState(0);
   const [hover, setHover] = useState(false);
   const [pinned, setPinned] = useState(false);
   const [tagHot, setTagHot] = useState(false);
+  const [deleteAsk, setDeleteAsk] = useState<DOMRect | null>(null);
+  const deleteTrigger = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!pinned) return;
@@ -136,7 +383,7 @@ export function ImageCard({
     let failing = false;
     let attempt = 0;
     let token = 0;
-    let useOriginal = item.animated;
+    let useOriginal = item.animated && !pauseMotion;
     let unpin: (() => void) | null = null;
     let retryTimer = 0;
     let timeoutTimer = 0;
@@ -215,7 +462,8 @@ export function ImageCard({
       loadThumb(pixelKey, async () => {
         const blob = await readPixels(item.id, kind);
         if (!blob || blob.size <= 0) return null;
-        return blob;
+        if (!pauseMotion || (await isStaticPoster(blob))) return blob;
+        return stillFrame(blob);
       })
         .then((next) => {
           if (!alive || my !== token) return;
@@ -353,8 +601,9 @@ export function ImageCard({
       observer.disconnect();
       document.removeEventListener("visibilitychange", onVisible);
       unpin?.();
+      setUrl(null);
     };
-  }, [item.animated, item.id, pixelKey, retryNonce]);
+  }, [item.animated, item.id, pauseMotion, pixelKey, retryNonce]);
 
   useEffect(() => {
     const node = mediaRef.current;
@@ -367,37 +616,45 @@ export function ImageCard({
     }
   }, [url]);
 
-  const menu = hover || pinned || memoOpen;
+  const menu = hover || pinned;
   const fit = menuFit(box.w, box.h);
+  const mediaStyle = placedMedia(box.w, box.h, item.width, item.height);
 
-  useEffect(() => {
-    if (!memoOpen) return;
-    const block = (event: Event) => {
-      const target = event.target as Node | null;
-      if (memoRef.current?.contains(target)) return;
-      event.preventDefault();
-      event.stopPropagation();
-      setMemoOpen(false);
-    };
-    document.addEventListener("pointerdown", block, true);
-    return () => document.removeEventListener("pointerdown", block, true);
-  }, [memoOpen]);
-
-  const finishMemo = () => {
-    const action = commitMemo(item.memo, draft);
-    setMemoOpen(false);
-    if (action === "cancel") return;
-    onMemo(item.id, action === "clear" ? "" : draft);
+  const prepareExport = () => {
+    if (viewer) return;
+    void primeOriginal(item).catch(() => undefined);
   };
 
   const onPointerDown = (event: ReactPointerEvent<HTMLLIElement>) => {
     if (event.button !== 0) return;
     const target = event.target as Element | null;
     if (target?.closest(".shot-menu button, .shot-menu a, .shot-menu input, .shot-menu textarea")) return;
+    prepareExport();
     const startX = event.clientX;
     const startY = event.clientY;
     const pointerId = event.pointerId;
+    const kind = event.pointerType || "mouse";
+    const stylus = stylusPointer(kind);
+    gestureKind.current = kind;
+    gesturePointer.current = pointerId;
+    pointerOwned.current = false;
+    const hit = target?.closest(".shot-hit");
+    // Capture the button, not the card. Capturing the card retargets the click
+    // away from the button, so a short tap never opens the image.
+    if (stylus && !viewer && hit instanceof HTMLElement) {
+      try {
+        hit.setPointerCapture(pointerId);
+      } catch {
+        /* a drawing surface may still hold this id; the move below still listens on window */
+      }
+    }
     let started = false;
+    const cleanup = () => {
+      window.removeEventListener("pointermove", move, true);
+      window.removeEventListener("pointerup", end, true);
+      window.removeEventListener("pointercancel", end, true);
+      if (slopCleanup.current === cleanup) slopCleanup.current = null;
+    };
     const move = (pointer: PointerEvent) => {
       if (pointer.pointerId !== pointerId || started) return;
       const dx = pointer.clientX - startX;
@@ -407,26 +664,91 @@ export function ImageCard({
         suppressClick.current = true;
         return;
       }
+      // Mouse: once the original file is cached, the browser drag carries it
+      // out and also reorders. A stylus must not take that shortcut — if the
+      // browser drag never starts, skipping here drops the gesture entirely.
+      if (!stylus && (nativeDrag.current || cachedOriginal(item.id))) {
+        suppressClick.current = true;
+        return;
+      }
+      if (nativeDrag.current) {
+        suppressClick.current = true;
+        return;
+      }
       started = true;
+      pointerOwned.current = true;
       suppressClick.current = true;
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", end);
-      window.removeEventListener("pointercancel", end);
+      cleanup();
       onDragStart(item.id, pointer);
     };
     const end = (pointer: PointerEvent) => {
       if (pointer.pointerId !== pointerId) return;
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", end);
-      window.removeEventListener("pointercancel", end);
+      cleanup();
+      // Let the browser drop capture as the pointer ends. Releasing it here
+      // swallows the click that should open the image after a short tap.
       if (!suppressClick.current) return;
       window.setTimeout(() => {
         suppressClick.current = false;
       }, 0);
     };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", end);
-    window.addEventListener("pointercancel", end);
+    slopCleanup.current = cleanup;
+    window.addEventListener("pointermove", move, true);
+    window.addEventListener("pointerup", end, true);
+    window.addEventListener("pointercancel", end, true);
+  };
+
+  const releaseGestureCapture = () => {
+    const pointerId = gesturePointer.current;
+    const hit = rootRef.current?.querySelector(".shot-hit");
+    if (pointerId === null || !(hit instanceof HTMLElement) || !hit.hasPointerCapture(pointerId)) return;
+    try {
+      hit.releasePointerCapture(pointerId);
+    } catch {
+      /* the drag already released it */
+    }
+  };
+
+  const onExportDragStart = (event: React.DragEvent<HTMLButtonElement>) => {
+    if (viewer) {
+      event.preventDefault();
+      return;
+    }
+    // The pointer session is already following the pen. A native drag would
+    // swallow pointerup, so the canvas drop would never land.
+    if (stylusPointer(gestureKind.current) && pointerOwned.current) {
+      event.preventDefault();
+      return;
+    }
+    const file = cachedOriginal(item.id);
+    const transfer = event.dataTransfer;
+    if (!file || !transfer) {
+      event.preventDefault();
+      return;
+    }
+    try {
+      writeOriginalDrag(transfer, item.id, file);
+    } catch {
+      event.preventDefault();
+      return;
+    }
+    const image = event.currentTarget.querySelector("img");
+    if (image instanceof HTMLImageElement) {
+      const rect = image.getBoundingClientRect();
+      transfer.setDragImage(image, Math.round(event.clientX - rect.left), Math.round(event.clientY - rect.top));
+    }
+    nativeDrag.current = true;
+    pointerOwned.current = false;
+    suppressClick.current = true;
+    slopCleanup.current?.();
+    onExternalDrag(item.id, { x: event.clientX, y: event.clientY });
+  };
+
+  const onExportDragEnd = () => {
+    nativeDrag.current = false;
+    releaseGestureCapture();
+    window.setTimeout(() => {
+      suppressClick.current = false;
+    }, 0);
   };
 
   const className = [
@@ -451,6 +773,7 @@ export function ImageCard({
       onPointerDown={onPointerDown}
       onPointerEnter={(event) => {
         if (event.pointerType === "mouse") setHover(true);
+        prepareExport();
       }}
       onPointerLeave={(event) => {
         if (event.pointerType === "mouse") setHover(false);
@@ -482,8 +805,11 @@ export function ImageCard({
       <button
         type="button"
         className="shot-hit"
+        draggable={viewer ? undefined : true}
         aria-label={`${item.name}を拡大`}
         aria-expanded={viewer ? undefined : menu}
+        onDragStart={onExportDragStart}
+        onDragEnd={onExportDragEnd}
         onClick={(event) => {
           if (suppressClick.current) {
             suppressClick.current = false;
@@ -506,7 +832,7 @@ export function ImageCard({
       >
         <div ref={frameRef} className="shot-frame">
           {origin ? <span className="shot-origin">{origin}</span> : null}
-          {url && item.mime.startsWith("video/") ? (
+          {url && item.mime.startsWith("video/") && !pauseMotion ? (
             <video
               ref={(node) => {
                 mediaRef.current = node;
@@ -519,6 +845,7 @@ export function ImageCard({
               width={item.width}
               height={item.height}
               draggable={false}
+              style={mediaStyle}
               onLoadedData={(event) => reportRef.current?.loaded(event.currentTarget.videoWidth, event.currentTarget.videoHeight)}
               onError={() => reportRef.current?.failed()}
             />
@@ -533,12 +860,43 @@ export function ImageCard({
               height={item.height}
               decoding="async"
               draggable={false}
+              style={mediaStyle}
               onLoad={(event) => reportRef.current?.loaded(event.currentTarget.naturalWidth, event.currentTarget.naturalHeight)}
               onError={() => reportRef.current?.failed()}
             />
           ) : null}
+          {hasInk && inkShown && !item.animated ? (
+            <InkStill imageId={item.id} revision={inkRev} style={{ ...mediaStyle, objectFit: "fill" }} />
+          ) : null}
+          {pauseMotion ? (
+            <span className="shot-play" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M8.6 6.4v11.2L18 12z" />
+              </svg>
+            </span>
+          ) : null}
         </div>
       </button>
+      {hasInk && !item.animated ? (
+        <div className="shot-ink-status">
+          <span className="shot-icon shot-ink-mark" aria-label="ペン書き込みあり">
+            <Pencil aria-hidden="true" />
+          </span>
+          <button
+            type="button"
+            className={inkShown ? "shot-icon is-on" : "shot-icon"}
+            aria-pressed={inkShown}
+            aria-label={inkShown ? "書き込みを隠す" : "書き込みを表示"}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              void setInkVisible(item.id, !inkShown);
+            }}
+          >
+            {inkShown ? <Eye aria-hidden="true" /> : <EyeOff aria-hidden="true" />}
+          </button>
+        </div>
+      ) : null}
       {status === "error" || status === "missing" ? (
         <div className="shot-fail">
           <span>{status === "missing" ? "画像データがありません" : "読み込めませんでした"}</span>
@@ -591,56 +949,63 @@ export function ImageCard({
             <Heart aria-hidden="true" fill={item.favorite ? "currentColor" : "none"} />
           </button>
           <button
+            ref={deleteTrigger}
             type="button"
             className="shot-icon"
             aria-label={bulk && selected ? "選択中の画像を削除" : `${item.name}を削除`}
             onPointerDown={(event) => event.stopPropagation()}
-            onClick={() => onDelete(item.id)}
+            onClick={(event) => {
+              event.stopPropagation();
+              const card = rootRef.current?.getBoundingClientRect();
+              if (!card) return;
+              setDeleteAsk(card);
+            }}
           >
             <Trash2 aria-hidden="true" />
           </button>
-          <button
-            type="button"
-            className="shot-icon shot-memo"
-            aria-label={`${item.name}のメモ`}
-            onPointerDown={(event) => event.stopPropagation()}
-            onClick={(event) => {
-              event.stopPropagation();
-              setDraft(item.memo);
-              setMemoOpen(true);
-            }}
-          >
-            <Pencil aria-hidden="true" />
-          </button>
-        </div>
-        {memoOpen ? (
-          <form
-            ref={memoRef}
-            className="shot-memo-pop"
-            onSubmit={(event) => event.preventDefault()}
-            onPointerDown={(event) => event.stopPropagation()}
-            onClick={(event) => event.stopPropagation()}
-          >
-            <input
-              aria-label="メモ"
-              value={draft}
-              maxLength={100}
-              autoFocus
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={(event) => {
+          {item.animated ? null : hasInk ? (
+            <span className="shot-ink-pair">
+              <button
+                type="button"
+                className="shot-icon shot-memo"
+                aria-label={`${item.name}のペン書き込み`}
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onInk(item.id);
+                }}
+              >
+                <Pencil aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                className={inkShown ? "shot-icon shot-ink-toggle is-on" : "shot-icon shot-ink-toggle"}
+                aria-pressed={inkShown}
+                aria-label={inkShown ? "書き込みを隠す" : "書き込みを表示"}
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void setInkVisible(item.id, !inkShown);
+                }}
+              >
+                {inkShown ? <Eye aria-hidden="true" /> : <EyeOff aria-hidden="true" />}
+              </button>
+            </span>
+          ) : (
+            <button
+              type="button"
+              className="shot-icon shot-memo"
+              aria-label={`${item.name}のペン書き込み`}
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
                 event.stopPropagation();
-                if (event.key === "Escape") {
-                  event.preventDefault();
-                  setMemoOpen(false);
-                }
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  finishMemo();
-                }
+                onInk(item.id);
               }}
-            />
-          </form>
-        ) : null}
+            >
+              <Pencil aria-hidden="true" />
+            </button>
+          )}
+        </div>
         {tags.length > 0 ? (
           <div className="shot-tags">
             {tags.map((tag) => (
@@ -664,6 +1029,19 @@ export function ImageCard({
         ) : null}
       </div>
       )}
+      {deleteAsk ? (
+        <ShotDeleteAsk
+          anchor={deleteAsk}
+          trigger={deleteTrigger.current}
+          body={bulk && selected ? "選択中の画像を削除しますか？" : "この画像を削除しますか？"}
+          onCancel={() => setDeleteAsk(null)}
+          onConfirm={() => {
+            const id = item.id;
+            setDeleteAsk(null);
+            onDelete(id);
+          }}
+        />
+      ) : null}
     </li>
   );
 }

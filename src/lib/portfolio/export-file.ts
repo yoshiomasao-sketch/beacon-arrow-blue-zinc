@@ -24,6 +24,39 @@ function schedule<T>(job: () => Promise<T>): Promise<T> {
 }
 
 export const OWN_FILE_DRAG = "application/x-komacho-file";
+/** Gallery thumbnail dragged out of the app. The payload is the original file, not the thumb or pen layer. */
+export const SHOT_DRAG = "application/x-komacho-shot";
+
+export type OriginalDragSink = {
+  effectAllowed: string;
+  setData: (type: string, value: string) => void;
+  items: { add: (file: File) => unknown; clear?: () => void };
+};
+
+/** A File around the stored original bytes. Does not re-encode or write anything back. */
+export function fileFromOriginal(meta: { name: string; mime: string; addedAt: number }, blob: Blob): File {
+  return new File([blob], exportFileName(meta.name, meta.mime), {
+    type: meta.mime,
+    lastModified: meta.addedAt || Date.now(),
+  });
+}
+
+/**
+ * Offer the original file to another app.
+ * String types mark the drag as ours so the gallery does not import a copy of itself.
+ */
+export function writeOriginalDrag(sink: OriginalDragSink, id: string, file: File): void {
+  try {
+    sink.items.clear?.();
+  } catch {
+    /* a protected drag store can still accept setData and add */
+  }
+  sink.effectAllowed = "copy";
+  sink.setData(SHOT_DRAG, id);
+  sink.setData(OWN_FILE_DRAG, id);
+  sink.setData("text/plain", file.name);
+  sink.items.add(file);
+}
 
 function remember(id: string, file: File): void {
   ready.set(id, file);
@@ -63,10 +96,7 @@ export function primeOriginal(meta: ImageMeta): Promise<File | null> {
     .then((blob) => {
       pending.delete(meta.id);
       if (!blob) return null;
-      const file = new File([blob], exportFileName(meta.name, meta.mime), {
-        type: meta.mime,
-        lastModified: meta.addedAt || Date.now(),
-      });
+      const file = fileFromOriginal(meta, blob);
       remember(meta.id, file);
       return file;
     })

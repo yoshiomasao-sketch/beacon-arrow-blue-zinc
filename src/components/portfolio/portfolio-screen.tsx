@@ -1,6 +1,7 @@
-import { ClipboardPaste, Crop, FileDown, Heart, ImagePlus, Play } from "lucide-react";
+import { ClipboardPaste, Crop, FileDown, Heart, ImagePlus, Play, Shuffle } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { BackupActions, type BackupController } from "@/components/portfolio/backup-actions";
+import { CanvasBoard } from "@/components/portfolio/canvas-board";
 import { captureErrorMessage, captureScreenFrame, SnipOverlay } from "@/components/portfolio/capture-dialog";
 import { FolderRail } from "@/components/portfolio/folder-rail";
 import { ImageCard } from "@/components/portfolio/image-card";
@@ -13,10 +14,12 @@ import { SpotConfirm } from "@/components/portfolio/spot-confirm";
 import { StorageDialog } from "@/components/portfolio/storage-dialog";
 import { TagRail } from "@/components/portfolio/tag-rail";
 import { Button } from "@/components/ui/button";
+import { centerSplit } from "@/lib/portfolio/canvas";
 import { selectedLibraryTab, activeLibraryTab, type LibraryTab } from "@/lib/portfolio/db";
 import { isBackupFileName } from "@/lib/portfolio/backup";
 import { fetchBrowserMedia, pixivBlockedMessage } from "@/lib/portfolio/browser-fetch";
-import { OWN_FILE_DRAG } from "@/lib/portfolio/export-file";
+import { startDesktopFileDrops, desktopDropsListening, type DesktopDrop } from "@/lib/portfolio/desktop-drop";
+import { OWN_FILE_DRAG, SHOT_DRAG } from "@/lib/portfolio/export-file";
 import { copiedHttpUrl, chooseDroppedPayload, fileFromDataUrl, sniffImage, type DroppedPayload, type ExternalImageSources } from "@/lib/portfolio/image-sniff";
 import {
   boxesInRect,
@@ -31,6 +34,8 @@ import {
   orderFromInsertion,
   passesTagFilter,
   readingSequence,
+  shuffleIds,
+  addedDateOrder,
   scrollTopForCenter,
   statusLabel,
   tagsInRailOrder,
@@ -38,6 +43,7 @@ import {
   type InsertMark,
 } from "@/lib/portfolio/logic";
 import { pixivIllustId } from "@/lib/portfolio/pixiv-url";
+import { axisLocked, drawerSpan, edgeGesture, gestureCommits, revealForMove, slideX, type EdgeGesture } from "@/lib/portfolio/phone-edge";
 import { slideshowCandidates } from "@/lib/portfolio/slideshow";
 import {
   addFiles,
@@ -75,6 +81,7 @@ import {
   saveFolderOpen,
   saveFolderPane,
   saveFolderWidth,
+  saveCanvasSplit,
   saveTagOpen,
   saveTagWidth,
   selectFolder,
@@ -125,8 +132,15 @@ function dragTypes(event: { dataTransfer: DataTransfer | null }): string[] {
   return Array.from(event.dataTransfer?.types ?? []);
 }
 
+/** True while a gallery thumbnail drag is in progress, so the page does not import that same file. */
+let galleryFileDrag = false;
+
 function isInternalDrag(types: readonly string[]): boolean {
-  return types.includes(OWN_FILE_DRAG) || types.includes(TAG_DRAG);
+  return types.includes(OWN_FILE_DRAG) || types.includes(SHOT_DRAG) || types.includes(TAG_DRAG);
+}
+
+function isLibraryFileDrag(types: readonly string[]): boolean {
+  return types.includes(OWN_FILE_DRAG) || types.includes(SHOT_DRAG);
 }
 
 /** A drop from the desktop or from another browser page. Internal tag and file drags are excluded. */
@@ -261,6 +275,7 @@ function dropMissMessage(reason: "browser" | "format" | "url"): string {
 }
 
 function isExternalFileDrag(event: { dataTransfer: DataTransfer | null }): boolean {
+  if (galleryFileDrag) return false;
   return isExternalDrop(dragTypes(event));
 }
 
@@ -369,11 +384,31 @@ export function PortfolioScreen() {
 
   const [compact, setCompact] = useState(false);
   const [phonePane, setPhonePane] = useState<PhonePane>(null);
+  const [gifMotion, setGifMotion] = useState(true);
+  const [canvasMode, setCanvasMode] = useState(false);
+  const [canvasFolderOpen, setCanvasFolderOpen] = useState(false);
+  const [canvasTagOpen, setCanvasTagOpen] = useState(false);
+  const [canvasOrient, setCanvasOrient] = useState<"portrait" | "landscape">("portrait");
+  const [splitLive, setSplitLive] = useState<number | null>(null);
+  const [sessionSplit, setSessionSplit] = useState(0.5);
+  const [splitWidth, setSplitWidth] = useState(0);
+  const splitRef = useRef<HTMLDivElement | null>(null);
+  const splitDragGen = useRef(0);
+  const [edgeSlide, setEdgeSlide] = useState<{
+    folder: { x: number; animate: boolean } | null;
+    tag: { x: number; animate: boolean } | null;
+  } | null>(null);
+  const phonePaneRef = useRef(phonePane);
+  const shownPaneRef = useRef<PhonePane>(phonePane);
+  if (!edgeSlide) shownPaneRef.current = phonePane;
+  phonePaneRef.current = phonePane;
+  const edgeTimer = useRef(0);
   const [contentPx, setContentPx] = useState(0);
   const [selected, setSelected] = useState<string[]>([]);
   const [openId, setOpenId] = useState<string | null>(null);
   const [pdfOpen, setPdfOpen] = useState(false);
   const [slideshowOpen, setSlideshowOpen] = useState(false);
+  const slideshowAnchorRef = useRef<HTMLSpanElement>(null);
   const [storageOpen, setStorageOpen] = useState(false);
   const [syncOpen, setSyncOpen] = useState(false);
   const [qrOpen, setQrOpen] = useState(false);
@@ -394,6 +429,7 @@ export function PortfolioScreen() {
   const [widthDrag, setWidthDrag] = useState<{ kind: "folder" | "tag"; width: number } | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [viewerHost, setViewerHost] = useState<HTMLDivElement | null>(null);
   const flowRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const pasteAbort = useRef<AbortController | null>(null);
@@ -404,21 +440,35 @@ export function PortfolioScreen() {
   const dropRef = useRef({ folder: null as string | null, index: null as number | null });
   const importDropRef = useRef<(transfer: DataTransfer) => void>(() => {});
   const importBackupRef = useRef<(files: readonly File[]) => void>(() => {});
+  const desktopDropRef = useRef<(drop: DesktopDrop) => void>(() => {});
   const backupRef = useRef<BackupController>(null);
   const previewRef = useRef<HTMLDivElement>(null);
   const dragPointRef = useRef<{ x: number; y: number } | null>(null);
+  const canvasDropRef = useRef(false);
   const markKeyRef = useRef("");
   const folderHoldRef = useRef<string | null>(null);
   const selectedRef = useRef(selected);
   const directionRef = useRef(direction);
   const placementsRef = useRef<FlowBox[]>([]);
   const galleryScroll = useRef(0);
+  const shownOpenId = useRef<string | null>(null);
   const viewerWasOpen = useRef(false);
+  const inkLaunch = useRef(false);
   selectedRef.current = selected;
   directionRef.current = direction;
 
-  const folderShown = compact ? phonePane === "folder" : folderOpen;
-  const tagShown = compact ? phonePane === "tag" : tagOpen;
+  useEffect(() => {
+    const onOrient = (event: Event) => {
+      const value = (event as CustomEvent<{ orientation?: string }>).detail?.orientation;
+      setCanvasOrient(value === "landscape" ? "landscape" : "portrait");
+    };
+    window.addEventListener("komacho-canvas-orient", onOrient);
+    return () => window.removeEventListener("komacho-canvas-orient", onOrient);
+  }, []);
+  const canvasOn = canvasMode && !compact;
+  const railsLocked = canvasOn && (openId !== null || slideshowOpen);
+  const folderShown = compact ? phonePane === "folder" : (canvasOn ? canvasFolderOpen : folderOpen) && !railsLocked;
+  const tagShown = compact ? phonePane === "tag" : (canvasOn ? canvasTagOpen : tagOpen) && !railsLocked;
   const folderW = widthDrag?.kind === "folder" ? widthDrag.width : folderWidth;
   const tagW = widthDrag?.kind === "tag" ? widthDrag.width : tagWidth;
 
@@ -489,6 +539,134 @@ export function PortfolioScreen() {
   }, []);
 
   useEffect(() => {
+    if (!compact) {
+      window.clearTimeout(edgeTimer.current);
+      setEdgeSlide(null);
+      return;
+    }
+    let gesture: EdgeGesture | null = null;
+    let startX = 0;
+    let startY = 0;
+    let locked = false;
+    let tracking = false;
+
+    const span = () => drawerSpan(window.innerWidth, Number.parseFloat(getComputedStyle(document.documentElement).fontSize) || 16);
+    const shown = (side: "folder" | "tag", active: boolean, reveal: number, width: number, animate: boolean) =>
+      active ? { x: slideX(side, reveal, width), animate } : null;
+
+    const finish = (event: TouchEvent, cancel: boolean) => {
+      if (!tracking || !gesture) return;
+      if (locked) event.preventDefault();
+      const current = gesture;
+      const moved = locked;
+      tracking = false;
+      locked = false;
+      gesture = null;
+      if (!moved) return;
+      const width = span();
+      const touch = event.changedTouches[0];
+      const dx = touch ? touch.clientX - startX : 0;
+      const reveal = revealForMove(current, dx, width);
+      const commit = !cancel && gestureCommits(current, reveal, width, window.innerWidth);
+      const folderActive = current.side === "folder" || ("other" in current && current.other === "folder");
+      const tagActive = current.side === "tag" || ("other" in current && current.other === "tag");
+      let next: PhonePane = phonePaneRef.current;
+      let folderReveal = reveal.folder;
+      let tagReveal = reveal.tag;
+      if (current.kind === "open") {
+        if (commit) {
+          next = current.side;
+          folderReveal = current.side === "folder" ? width : 0;
+          tagReveal = current.side === "tag" ? width : 0;
+        } else {
+          next = current.other;
+          folderReveal = current.other === "folder" ? width : 0;
+          tagReveal = current.other === "tag" ? width : 0;
+        }
+      } else if (commit) {
+        next = null;
+        if (current.side === "folder") folderReveal = 0;
+        else tagReveal = 0;
+      } else {
+        next = current.side;
+        if (current.side === "folder") folderReveal = width;
+        else tagReveal = width;
+      }
+      setEdgeSlide({
+        folder: shown(folderActive ? "folder" : "tag", folderActive, folderReveal, width, true),
+        tag: shown(tagActive ? "tag" : "folder", tagActive, tagReveal, width, true),
+      });
+      shownPaneRef.current = next;
+      window.clearTimeout(edgeTimer.current);
+      edgeTimer.current = window.setTimeout(() => {
+        setPhonePane(next);
+        setEdgeSlide(null);
+      }, 230);
+    };
+
+    const onStart = (event: TouchEvent) => {
+      if (event.touches.length !== 1) return;
+      if (document.querySelector(".slideshow-stage, .lightbox-overlay, [role='dialog']")) return;
+      const touch = event.touches[0];
+      if (!touch) return;
+      const target = event.target instanceof Element ? event.target : null;
+      const next = edgeGesture({
+        startX: touch.clientX,
+        viewport: window.innerWidth,
+        open: shownPaneRef.current,
+        inFolder: Boolean(target?.closest(".folder-rail:not(.is-collapsed)")),
+        inTag: Boolean(target?.closest(".tag-rail:not(.is-collapsed)")),
+        editable: Boolean(target?.closest("input, textarea, select, [contenteditable='true']")),
+      });
+      if (!next) return;
+      gesture = next;
+      startX = touch.clientX;
+      startY = touch.clientY;
+      locked = false;
+      tracking = true;
+    };
+    const onMove = (event: TouchEvent) => {
+      if (!tracking || !gesture || event.touches.length !== 1) return;
+      const touch = event.touches[0];
+      if (!touch) return;
+      const dx = touch.clientX - startX;
+      const dy = touch.clientY - startY;
+      if (!locked) {
+        if (Math.hypot(dx, dy) < 12) return;
+        if (!axisLocked(gesture, dx, dy)) {
+          tracking = false;
+          gesture = null;
+          return;
+        }
+        locked = true;
+        window.clearTimeout(edgeTimer.current);
+      }
+      event.preventDefault();
+      const width = span();
+      const reveal = revealForMove(gesture, dx, width);
+      const folderActive = gesture.side === "folder" || ("other" in gesture && gesture.other === "folder");
+      const tagActive = gesture.side === "tag" || ("other" in gesture && gesture.other === "tag");
+      setEdgeSlide({
+        folder: shown("folder", folderActive, reveal.folder, width, false),
+        tag: shown("tag", tagActive, reveal.tag, width, false),
+      });
+    };
+    const onEnd = (event: TouchEvent) => finish(event, false);
+    const onCancel = (event: TouchEvent) => finish(event, true);
+    window.addEventListener("touchstart", onStart, { capture: true, passive: true });
+    window.addEventListener("touchmove", onMove, { capture: true, passive: false });
+    window.addEventListener("touchend", onEnd, { capture: true, passive: false });
+    window.addEventListener("touchcancel", onCancel, { capture: true, passive: false });
+    return () => {
+      window.clearTimeout(edgeTimer.current);
+      window.removeEventListener("touchstart", onStart, true);
+      window.removeEventListener("touchmove", onMove, true);
+      window.removeEventListener("touchend", onEnd, true);
+      window.removeEventListener("touchcancel", onCancel, true);
+    };
+  }, [compact]);
+
+  useEffect(() => {
     if (compact) cancelPendingAdd();
   }, [compact]);
 
@@ -510,7 +688,7 @@ export function PortfolioScreen() {
         if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
         return;
       }
-      if (dragTypes(event).includes(OWN_FILE_DRAG) || dragHitsField(event)) return;
+      if (galleryFileDrag || isLibraryFileDrag(dragTypes(event)) || dragHitsField(event)) return;
       // Chrome opens a new tab at about:blank#blocked when a cross-window image
       // drop is not accepted. Types are often hidden until dragover is cancelled.
       event.preventDefault();
@@ -521,7 +699,7 @@ export function PortfolioScreen() {
         event.preventDefault();
         return;
       }
-      if (dragTypes(event).includes(OWN_FILE_DRAG) || dragHitsField(event)) return;
+      if (galleryFileDrag || isLibraryFileDrag(dragTypes(event)) || dragHitsField(event)) return;
       if (handledDrops.has(event)) return;
       event.preventDefault();
       const transfer = event.dataTransfer;
@@ -559,6 +737,24 @@ export function PortfolioScreen() {
       window.removeEventListener("drop", onDrop, true);
       document.removeEventListener("drop", onDrop);
       window.removeEventListener("dragend", end);
+    };
+  }, []);
+
+  useEffect(() => {
+    let stop = () => {};
+    let alive = true;
+    void startDesktopFileDrops((drop) => {
+      if (alive) desktopDropRef.current(drop);
+    }).then((unlisten) => {
+      if (!alive) {
+        unlisten();
+        return;
+      }
+      stop = unlisten;
+    });
+    return () => {
+      alive = false;
+      stop();
     };
   }, []);
 
@@ -661,6 +857,9 @@ export function PortfolioScreen() {
     if (!scroller) return;
     if (openId) {
       viewerWasOpen.current = true;
+      const paging = shownOpenId.current !== null && shownOpenId.current !== openId;
+      if (!paging) shownOpenId.current = openId;
+      if (paging) return;
       const top = galleryScroll.current;
       const keep = () => {
         if (scroller.isConnected) scroller.scrollTop = top;
@@ -673,6 +872,7 @@ export function PortfolioScreen() {
         for (const timer of timers) window.clearTimeout(timer);
       };
     }
+    shownOpenId.current = null;
     if (!viewerWasOpen.current) return;
     const top = galleryScroll.current;
     const keep = () => {
@@ -685,6 +885,34 @@ export function PortfolioScreen() {
       window.cancelAnimationFrame(frame);
       for (const timer of timers) window.clearTimeout(timer);
     };
+  }, [openId]);
+
+  useEffect(() => {
+    if (!openId || shownOpenId.current === openId) return;
+    shownOpenId.current = openId;
+    const scroller = scrollRef.current;
+    const node = scroller?.querySelector(`[data-shot-id="${CSS.escape(openId)}"]`);
+    if (!scroller || !(node instanceof HTMLElement)) return;
+    const scrollerRect = scroller.getBoundingClientRect();
+    const cardRect = node.getBoundingClientRect();
+    const head = scroller.querySelector(".library-head");
+    const sticky = head instanceof HTMLElement ? head.getBoundingClientRect().height : 0;
+    const top = scrollTopForCenter(scroller.scrollTop, scrollerRect.top, scrollerRect.height, cardRect.top, cardRect.height, sticky);
+    galleryScroll.current = top;
+    const start = scroller.scrollTop;
+    const delta = top - start;
+    if (Math.abs(delta) < 1) return;
+    const duration = Math.min(420, Math.max(180, Math.abs(delta) * 0.45));
+    const t0 = performance.now();
+    let frame = 0;
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - t0) / duration);
+      const eased = 1 - (1 - t) ** 3;
+      if (scroller.isConnected) scroller.scrollTop = start + delta * eased;
+      if (t < 1) frame = window.requestAnimationFrame(tick);
+    };
+    frame = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(frame);
   }, [openId]);
 
   const fitted = fitColumns(columns, contentPx, 148, GALLERY_GAP_PX);
@@ -739,6 +967,12 @@ export function PortfolioScreen() {
   const openAt = (id: string) => {
     if (!openId) galleryScroll.current = scrollRef.current?.scrollTop ?? 0;
     setOpenId(id);
+  };
+  const openInk = (id: string) => {
+    const target = items.find((entry) => entry.id === id);
+    if (compact || !target || target.animated) return;
+    inkLaunch.current = true;
+    openAt(id);
   };
 
   const scrollToId = (id: string) => {
@@ -816,7 +1050,13 @@ export function PortfolioScreen() {
 
   const toggleFolder = () => {
     if (compact) {
+      window.clearTimeout(edgeTimer.current);
+      setEdgeSlide(null);
       setPhonePane((current) => (current === "folder" ? null : "folder"));
+      return;
+    }
+    if (canvasOn) {
+      setCanvasFolderOpen((current) => !current);
       return;
     }
     void saveFolderOpen(!folderOpen);
@@ -824,7 +1064,13 @@ export function PortfolioScreen() {
 
   const toggleTag = () => {
     if (compact) {
+      window.clearTimeout(edgeTimer.current);
+      setEdgeSlide(null);
       setPhonePane((current) => (current === "tag" ? null : "tag"));
+      return;
+    }
+    if (canvasOn) {
+      setCanvasTagOpen((current) => !current);
       return;
     }
     void saveTagOpen(!tagOpen);
@@ -855,21 +1101,123 @@ export function PortfolioScreen() {
     window.addEventListener("pointercancel", end);
   };
 
+  const SPLITTER = 12;
+  const splitRatio = splitLive ?? sessionSplit;
+  const splitShare = splitWidth > 0 ? centerSplit(splitWidth, splitRatio, SPLITTER) : splitRatio;
+  const splitStyle = canvasOn
+    ? splitWidth > 0
+      ? { gridTemplateColumns: `${Math.round((splitWidth - SPLITTER) * splitShare)}px ${SPLITTER}px minmax(0, 1fr)` }
+      : { gridTemplateColumns: `minmax(0, ${splitRatio}fr) ${SPLITTER}px minmax(0, ${Math.max(0.0001, 1 - splitRatio)}fr)` }
+    : undefined;
+
+  useLayoutEffect(() => {
+    const node = splitRef.current;
+    if (!node || !canvasOn) return;
+    const measure = () => {
+      const next = node.clientWidth;
+      setSplitWidth((current) => (current === next ? current : next));
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [canvasOn]);
+
+  const beginCanvasSplit = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const pointerId = event.pointerId;
+    const dragGen = splitDragGen.current;
+    const handle = event.currentTarget;
+    try {
+      handle.setPointerCapture(pointerId);
+    } catch {
+      /* a synthetic pointer still ends through the window listeners */
+    }
+    const shareAt = (clientX: number) => {
+      const node = splitRef.current;
+      if (!node) return null;
+      const box = node.getBoundingClientRect();
+      const usable = Math.max(1, box.width - SPLITTER);
+      const raw = (clientX - box.left - SPLITTER / 2) / usable;
+      return centerSplit(box.width, raw, SPLITTER);
+    };
+    const apply = (clientX: number) => {
+      const share = shareAt(clientX);
+      if (share !== null) setSplitLive(share);
+    };
+    let closed = false;
+    const finish = (clientX: number) => {
+      if (closed) return;
+      closed = true;
+      const share = shareAt(clientX);
+      setSplitLive(null);
+      if (share !== null && dragGen === splitDragGen.current) setSessionSplit(share);
+      document.documentElement.classList.remove("is-canvas-splitting");
+      window.removeEventListener("pointermove", move, true);
+      window.removeEventListener("pointerup", end, true);
+      window.removeEventListener("pointercancel", end, true);
+      handle.removeEventListener("lostpointercapture", lost);
+    };
+    const move = (pointer: PointerEvent) => {
+      if (pointer.pointerId !== pointerId) return;
+      pointer.preventDefault();
+      apply(pointer.clientX);
+    };
+    const end = (pointer: PointerEvent) => {
+      if (pointer.pointerId !== pointerId) return;
+      finish(pointer.clientX);
+    };
+    const lost = (pointer: PointerEvent) => {
+      if (pointer.pointerId !== pointerId) return;
+      finish(pointer.clientX);
+    };
+    document.documentElement.classList.add("is-canvas-splitting");
+    apply(event.clientX);
+    window.addEventListener("pointermove", move, true);
+    window.addEventListener("pointerup", end, true);
+    window.addEventListener("pointercancel", end, true);
+    handle.addEventListener("lostpointercapture", lost);
+  };
+
+  const toggleCanvasMode = () => {
+    galleryScroll.current = scrollRef.current?.scrollTop ?? galleryScroll.current;
+    splitDragGen.current += 1;
+    document.documentElement.classList.remove("is-canvas-splitting");
+    setSplitLive(null);
+    setSessionSplit(0.5);
+    setCanvasFolderOpen(false);
+    setCanvasTagOpen(false);
+    setCanvasMode((current) => !current);
+    void saveCanvasSplit(0.5);
+  };
+
   const movingIds = dragId && selected.includes(dragId) && selected.length > 1 ? selected : dragId ? [dragId] : [];
   const ownerFolders = new Set(movingIds.map((id) => items.find((item) => item.id === id)?.folderId).filter((id): id is string => !!id));
   const ownerFolderId = ownerFolders.size === 1 ? [...ownerFolders][0]! : null;
 
   const onCardDragStart = (id: string, event: PointerEvent) => {
+    beginCardDrag(id, event.clientX, event.clientY, "pointer");
+    event.preventDefault();
+  };
+
+  const onExternalDrag = (id: string, point: { x: number; y: number }) => {
+    beginCardDrag(id, point.x, point.y, "native");
+  };
+
+  const beginCardDrag = (id: string, clientX: number, clientY: number, source: "pointer" | "native") => {
     if (compact || viewerLocked()) return;
     dragCleanup.current?.();
+    if (source === "native") galleryFileDrag = true;
     const group = selectedRef.current.includes(id) && selectedRef.current.length > 1 ? [...selectedRef.current] : [id];
-    const preview = dragPreviewOf(id);
-    dragPointRef.current = { x: event.clientX, y: event.clientY };
+    dragPointRef.current = { x: clientX, y: clientY };
+    canvasDropRef.current = false;
     markKeyRef.current = "";
     folderHoldRef.current = null;
     dropRef.current = { folder: null, index: null };
     setDragId(id);
-    setDragPreview(preview);
+    setDragPreview(source === "pointer" ? dragPreviewOf(id) : null);
     setInsertMarks([]);
     setDropFolderId(null);
     const showMarks = (marks: InsertMark[]) => {
@@ -883,11 +1231,22 @@ export function PortfolioScreen() {
       folderHoldRef.current = folder;
       setDropFolderId(folder);
     };
-    const move = (pointer: PointerEvent) => {
-      dragPointRef.current = { x: pointer.clientX, y: pointer.clientY };
+    const moveTo = (x: number, y: number) => {
+      dragPointRef.current = { x, y };
       const previewNode = previewRef.current;
-      if (previewNode) placePreview(previewNode, pointer.clientX, pointer.clientY);
-      const hit = document.elementFromPoint(pointer.clientX, pointer.clientY);
+      if (previewNode) placePreview(previewNode, x, y);
+      const hit = document.elementFromPoint(x, y);
+      const overCanvas = Boolean(hit?.closest(".canvas-pane"));
+      if (overCanvas && !canvasDropRef.current) {
+        window.dispatchEvent(new CustomEvent("komacho-canvas-drag-enter"));
+      }
+      canvasDropRef.current = overCanvas;
+      if (overCanvas) {
+        dropRef.current = { folder: null, index: null };
+        showFolder(null);
+        showMarks([]);
+        return;
+      }
       const folderId = hit?.closest("[data-folder-id]")?.getAttribute("data-folder-id") ?? null;
       const folder = folderId && folderId !== ALL_FOLDERS ? folderId : null;
       if (folder) {
@@ -901,20 +1260,30 @@ export function PortfolioScreen() {
       if (!flowNode) return;
       const rect = flowNode.getBoundingClientRect();
       const slot = insertionAt(placementsRef.current, group, {
-        x: pointer.clientX - rect.left,
-        y: pointer.clientY - rect.top,
+        x: x - rect.left,
+        y: y - rect.top,
       });
       dropRef.current = { folder: null, index: slot ? slot.index : null };
       showMarks(slot?.marks ?? []);
     };
     let finished = false;
+    const detach = () => {
+      window.removeEventListener("pointermove", onPointerMove, true);
+      window.removeEventListener("pointerup", onPointerUp, true);
+      window.removeEventListener("pointercancel", onPointerCancel, true);
+      window.removeEventListener("dragover", onDragOver, true);
+      window.removeEventListener("drop", onDrop, true);
+      window.removeEventListener("dragend", onDragEnd, true);
+    };
     const end = (commit: boolean) => {
       if (finished) return;
       finished = true;
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", finish);
-      window.removeEventListener("pointercancel", cancel);
-      dragCleanup.current = null;
+      galleryFileDrag = false;
+      detach();
+      if (dragCleanup.current === cancel) dragCleanup.current = null;
+      const point = dragPointRef.current;
+      const overCanvas = canvasDropRef.current;
+      canvasDropRef.current = false;
       const folder = dropRef.current.folder;
       const index = dropRef.current.index;
       dropRef.current = { folder: null, index: null };
@@ -926,6 +1295,10 @@ export function PortfolioScreen() {
       setInsertMarks([]);
       setDropFolderId(null);
       if (!commit) return;
+      if (overCanvas && point) {
+        window.dispatchEvent(new CustomEvent("komacho-canvas-drop", { detail: { imageId: id, clientX: point.x, clientY: point.y } }));
+        return;
+      }
       if (folder && folder !== ALL_FOLDERS) {
         void moveImagesToFolder(group, folder);
         return;
@@ -936,19 +1309,58 @@ export function PortfolioScreen() {
       setVisibleOrder(order);
       void commitImageOrder();
     };
-    const finish = () => end(true);
+    const onPointerMove = (pointer: PointerEvent) => moveTo(pointer.clientX, pointer.clientY);
+    const onPointerUp = (pointer: PointerEvent) => {
+      const leftWindow =
+        pointer.clientX < 0 ||
+        pointer.clientY < 0 ||
+        pointer.clientX > window.innerWidth ||
+        pointer.clientY > window.innerHeight;
+      if (leftWindow) {
+        end(false);
+        return;
+      }
+      moveTo(pointer.clientX, pointer.clientY);
+      const hit = document.elementFromPoint(pointer.clientX, pointer.clientY);
+      const overCanvas = Boolean(hit?.closest(".canvas-pane"));
+      if (overCanvas && !canvasDropRef.current) window.dispatchEvent(new CustomEvent("komacho-canvas-drag-enter"));
+      canvasDropRef.current = overCanvas;
+      end(true);
+    };
+    const onPointerCancel = () => end(false);
+    const onDragOver = (event: globalThis.DragEvent) => {
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+      moveTo(event.clientX, event.clientY);
+    };
+    const onDrop = (event: globalThis.DragEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      moveTo(event.clientX, event.clientY);
+      const hit = document.elementFromPoint(event.clientX, event.clientY);
+      const overCanvas = Boolean(hit?.closest(".canvas-pane"));
+      if (overCanvas && !canvasDropRef.current) window.dispatchEvent(new CustomEvent("komacho-canvas-drag-enter"));
+      canvasDropRef.current = overCanvas;
+      end(true);
+    };
+    const onDragEnd = () => end(false);
     const cancel = () => end(false);
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", finish);
-    window.addEventListener("pointercancel", cancel);
-    dragCleanup.current = () => end(false);
-    event.preventDefault();
+    if (source === "native") {
+      window.addEventListener("dragover", onDragOver, true);
+      window.addEventListener("drop", onDrop, true);
+      window.addEventListener("dragend", onDragEnd, true);
+    } else {
+      window.addEventListener("pointermove", onPointerMove, true);
+      window.addEventListener("pointerup", onPointerUp, true);
+      window.addEventListener("pointercancel", onPointerCancel, true);
+    }
+    dragCleanup.current = cancel;
   };
 
   const onGalleryPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (compact || viewerLocked() || event.button !== 0) return;
     const target = event.target as Element | null;
-    if (target?.closest(".shot-card, button, a, input, textarea, select, label, .library-head")) return;
+    if (target?.closest(".shot-card, button, a, input, textarea, select, label, .library-head, .canvas-pane, .canvas-split-handle, .gallery-viewer-host")) return;
     const flowNode = flowRef.current;
     const scroller = scrollRef.current;
     if (!flowNode || !scroller) return;
@@ -1203,6 +1615,13 @@ export function PortfolioScreen() {
       readDrag(transfer, "text/plain"),
       readDrag(transfer, "DownloadURL"),
     );
+    if (
+      rawFiles.length === 0 &&
+      plan.primary.urls.length + plan.primary.dataUrls.length === 0 &&
+      desktopDropsListening()
+    ) {
+      return;
+    }
     logDrop({
       types: Array.from(transfer.types),
       files: rawFiles.map((file) => ({ name: file.name, type: file.type || "(none)", size: file.size })),
@@ -1297,6 +1716,32 @@ export function PortfolioScreen() {
     }
   };
   importDropRef.current = finishExternalDrop;
+  desktopDropRef.current = (drop) => {
+    setFileDrag(false);
+    if (drop.files.length === 0) {
+      if (drop.failed > 0) {
+        notify("エクスプローラーからファイルを読み取れませんでした。「画像を取り込む」から選んでください。データは変更していません。");
+      }
+      return;
+    }
+    const node = drop.point ? document.elementFromPoint(drop.point.x, drop.point.y) : document.querySelector(".library-main");
+    const central = Boolean(node?.closest(".library-main, .drop-veil"));
+    const backups = drop.files.filter((file) => isBackupFileName(file.name));
+    if (backups.length > 0) {
+      if (central && drop.files.length === 1) {
+        importBackupRef.current(drop.files);
+        return;
+      }
+      notify(
+        drop.files.length === backups.length
+          ? "バックアップは、中央の画像エリアにドロップしてください。ライブラリは変更していません。"
+          : "バックアップファイルは1つだけ、ほかのファイルと分けてドロップしてください。ライブラリは変更していません。",
+      );
+      return;
+    }
+    void importExternalDrop(drop.files, chooseDroppedPayload("", "", ""));
+    if (drop.failed > 0) notify(`${drop.failed}件は読み取れませんでした。取り込めた画像以外は、そのままにしています。`);
+  };
   importBackupRef.current = (files) => {
     setFileDrag(false);
     const backups = files.filter((file) => isBackupFileName(file.name));
@@ -1387,20 +1832,35 @@ export function PortfolioScreen() {
   return (
     <div
       className="library-shell"
-      style={{ ["--folder-width" as string]: `${folderW}px`, ["--tag-width" as string]: `${tagW}px` }}
+      style={{
+        ["--folder-width" as string]: `${folderW}px`,
+        ["--tag-width" as string]: `${tagW}px`,
+        ...(!compact && !folderShown ? { ["--folder-lane" as string]: "var(--rail-collapsed)" } : {}),
+        ...(!compact && !tagShown ? { ["--tag-lane" as string]: "var(--rail-collapsed)" } : {}),
+      }}
       onDragEnter={onShellDragEnter}
       onDragOver={onShellDragOver}
       onDragLeave={onShellDragLeave}
       onDrop={onShellDrop}
     >
-      {compact && phonePane ? (
-        <button type="button" className="phone-scrim" aria-label="欄を閉じる" onClick={() => setPhonePane(null)} />
+      {compact && (phonePane || edgeSlide) ? (
+        <button
+          type="button"
+          className="phone-scrim"
+          aria-label="欄を閉じる"
+          onClick={() => {
+            window.clearTimeout(edgeTimer.current);
+            setEdgeSlide(null);
+            setPhonePane(null);
+          }}
+        />
       ) : null}
       <FolderRail
         folders={folders}
         items={items}
         selected={folderId}
         open={folderShown}
+        slide={compact ? edgeSlide?.folder ?? null : null}
         width={folderW}
         dragging={dragId !== null}
         ownerFolderId={ownerFolderId}
@@ -1422,14 +1882,23 @@ export function PortfolioScreen() {
         onPane={(height) => void saveFolderPane(height)}
         onJump={jumpTo}
         viewer={compact}
+        locked={railsLocked}
       />
       {folderShown && !compact ? (
         <div className="folder-split" role="separator" aria-orientation="vertical" aria-label="フォルダ欄の幅" onPointerDown={(event) => beginWidth("folder", event)} />
       ) : null}
-      <div className="library-main" ref={scrollRef} onPointerDown={onGalleryPointerDown}>
+      <div className={canvasOn ? "library-main is-canvas" : "library-main"} ref={canvasOn ? undefined : scrollRef} onPointerDown={onGalleryPointerDown}>
         <header className="library-head">
           <div className="tool-stack">
-            <div className="tool-row tool-row-main">
+            <div
+              className="tool-row tool-row-main"
+              onClick={(event) => {
+                if (!compact) return;
+                const target = event.target;
+                if (!(target instanceof Element) || target.closest("button, a, input, textarea, select, label")) return;
+                scrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+              }}
+            >
               {compact ? null : (
                 <div className="tool-cluster">
                   <span className="tool-label">タブ</span>
@@ -1481,7 +1950,7 @@ export function PortfolioScreen() {
               <BackupActions ref={backupRef} disabled={phase !== "ready"} viewer={compact} tab={activeLibraryTab()} />
               <Button
                 variant="quiet"
-                className="aux-btn"
+                className="aux-btn phone-shelved"
                 data-spot-trigger=""
                 disabled={phase !== "ready" || resetting}
                 onClick={(event) => setResetAsk(event.currentTarget.getBoundingClientRect())}
@@ -1517,6 +1986,7 @@ export function PortfolioScreen() {
               <Button variant="quiet" className="aux-btn phone-shelved" onClick={() => setStorageOpen(true)}>
                 容量
               </Button>
+              <span ref={slideshowAnchorRef} className="slideshow-anchor">
               <Button
                 variant="quiet"
                 className="aux-btn"
@@ -1532,12 +2002,81 @@ export function PortfolioScreen() {
                 <Play className="size-4" aria-hidden="true" />
                 スライドショー
               </Button>
+              </span>
+              <Button
+                variant="quiet"
+                className="aux-btn"
+                disabled={phase !== "ready" || visible.length < 2}
+                onClick={() => {
+                  const shuffled = shuffleIds(visible.map((item) => item.id));
+                  const stored = direction === "desc" ? shuffled.slice().reverse() : shuffled;
+                  setVisibleOrder(stored, compact);
+                  void commitImageOrder(compact);
+                }}
+              >
+                <Shuffle className="size-4" aria-hidden="true" />
+                シャッフル
+              </Button>
+              <Button
+                variant="quiet"
+                className="aux-btn"
+                disabled={phase !== "ready" || visible.length < 2}
+                onClick={() => {
+                  const sorted = addedDateOrder(visible);
+                  const stored = direction === "desc" ? sorted.slice().reverse() : sorted;
+                  setVisibleOrder(stored, compact);
+                  void commitImageOrder(compact);
+                }}
+              >
+                日付順でソート
+              </Button>
+              <Button
+                variant="quiet"
+                className="aux-btn"
+                disabled={phase !== "ready"}
+                aria-pressed={gifMotion}
+                onClick={() => setGifMotion((current) => !current)}
+              >
+                {gifMotion ? "アニメ▶️" : "アニメ⏸️"}
+              </Button>
               <Button variant="quiet" className="tool-shelved" onClick={() => setSyncOpen(true)}>
                 同期
               </Button>
               <Button variant="quiet" className="tool-shelved" onClick={() => setQrOpen(true)}>
                 QR接続テスト
               </Button>
+              <div className="canvas-mode-cluster phone-shelved">
+                {canvasOn ? (
+                  <Button variant="quiet" className="aux-btn" disabled={phase !== "ready"} onClick={() => window.dispatchEvent(new CustomEvent("komacho-canvas-save"))}>
+                    保存
+                  </Button>
+                ) : null}
+                {canvasOn ? (
+                  <Button variant="quiet" className="aux-btn" disabled={phase !== "ready"} onClick={() => window.dispatchEvent(new CustomEvent("komacho-canvas-copy"))}>
+                    コピー
+                  </Button>
+                ) : null}
+                <Button
+                  variant="quiet"
+                  className={canvasOn ? "aux-btn canvas-mode-btn is-on" : "aux-btn canvas-mode-btn"}
+                  aria-pressed={canvasOn}
+                  disabled={phase !== "ready"}
+                  onClick={toggleCanvasMode}
+                >
+                  キャンバスモード
+                </Button>
+                {canvasOn ? (
+                  <Button
+                    variant="quiet"
+                    className="aux-btn"
+                    disabled={phase !== "ready"}
+                    aria-pressed={canvasOrient === "landscape"}
+                    onClick={() => window.dispatchEvent(new CustomEvent("komacho-canvas-flip"))}
+                  >
+                    {canvasOrient === "landscape" ? "横" : "縦"}
+                  </Button>
+                ) : null}
+              </div>
             </div>
           </div>
           {pasteNote ? (
@@ -1571,6 +2110,9 @@ export function PortfolioScreen() {
             />
           </div>
         </header>
+        <div className={canvasOn ? "canvas-split" : "gallery-only"} ref={splitRef} style={splitStyle}>
+          <div className="gallery-frame">
+          <div className="canvas-gallery" ref={canvasOn ? scrollRef : undefined}>
         <main className="gallery-pad">
           <p className="mb-2 text-sm text-ink-muted">{phase === "ready" ? statusLabel(visible.length, importing) : "ライブラリを開いています"}</p>
           {phase !== "ready" ? (
@@ -1591,7 +2133,9 @@ export function PortfolioScreen() {
                   dragging={movingIds.includes(item.id)}
                   insertEdge={movingIds.includes(item.id) ? null : (insertMarks.find((mark) => mark.id === item.id)?.edge ?? null)}
                   onOpen={openAt}
+                  onInk={openInk}
                   onDragStart={onCardDragStart}
+                  onExternalDrag={onExternalDrag}
                   flash={flashId === item.id}
                   fading={flashId === item.id && flashFade}
                   origin={showOrigin ? folderPath(folders, item.folderId) : ""}
@@ -1613,6 +2157,7 @@ export function PortfolioScreen() {
                   }}
                   onTagPrompt={(imageId, tagId, rect) => setPrompt({ kind: "image", id: tagId, imageId, ...popAt(rect) })}
                   viewer={compact}
+                  gifMotion={gifMotion}
                 />
               ))}
               {marquee && marquee.w + marquee.h > 0 ? (
@@ -1621,6 +2166,23 @@ export function PortfolioScreen() {
             </div>
           )}
         </main>
+          </div>
+          <div ref={setViewerHost} className="gallery-viewer-host" />
+          </div>
+          {canvasOn ? (
+            <div
+              className={splitLive !== null ? "canvas-split-handle is-dragging" : "canvas-split-handle"}
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="一覧とキャンバスの幅"
+              aria-valuemin={15}
+              aria-valuemax={85}
+              aria-valuenow={Math.round(splitShare * 100)}
+              onPointerDown={beginCanvasSplit}
+            />
+          ) : null}
+          {canvasOn ? <CanvasBoard images={items} libraryEpoch={libraryEpoch} ready={phase === "ready"} /> : null}
+        </div>
       </div>
       {tagShown && !compact ? (
         <div className="tag-split" role="separator" aria-orientation="vertical" aria-label="タグ欄の幅" onPointerDown={(event) => beginWidth("tag", event)} />
@@ -1632,6 +2194,7 @@ export function PortfolioScreen() {
         selected={activeTagIds}
         hidden={hiddenTagIds}
         open={tagShown}
+        slide={compact ? edgeSlide?.tag ?? null : null}
         width={tagW}
         onToggle={toggleTag}
         onSelect={(id) => void selectTag(id)}
@@ -1644,6 +2207,7 @@ export function PortfolioScreen() {
         onRename={renameTag}
         onDelete={(id) => void removeTag(id)}
         viewer={compact}
+        locked={railsLocked}
       />
       <input
         ref={fileRef}
@@ -1721,6 +2285,9 @@ export function PortfolioScreen() {
         onClose={() => setOpenId(null)}
         onToggleFavorite={(id) => void toggleFavorite(id, { fromLightbox: true })}
         tags={openItem ? listedTags.filter((tag) => openItem.tagIds.includes(tag.id)) : []}
+        launchInk={inkLaunch}
+        contained={canvasOn}
+        container={viewerHost}
         onStep={(delta) => {
           if (!openId) return;
           const count = readingIds.length;
@@ -1732,7 +2299,7 @@ export function PortfolioScreen() {
         }}
       />
       <PdfPreview open={pdfOpen} items={visible} columns={columns} onOpenChange={setPdfOpen} />
-      <Slideshow open={slideshowOpen} items={visible} onOpenChange={setSlideshowOpen} />
+      <Slideshow open={slideshowOpen} items={visible} onOpenChange={setSlideshowOpen} dock={canvasOn} container={canvasOn ? viewerHost : null} anchor={slideshowAnchorRef.current} />
       <StorageDialog open={storageOpen} onOpenChange={setStorageOpen} />
       <LanSyncDialog open={syncOpen} onOpenChange={setSyncOpen} />
       <QrLinkDialog

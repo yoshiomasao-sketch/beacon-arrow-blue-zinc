@@ -102,6 +102,8 @@ export function TagRail({
   onRename,
   onDelete,
   viewer = false,
+  slide = null,
+  locked = false,
 }: {
   tags: Tag[];
   folders: TagFolder[];
@@ -121,6 +123,8 @@ export function TagRail({
   onRename: (id: string, name: string) => Promise<boolean>;
   onDelete: (id: string) => void;
   viewer?: boolean;
+  slide?: { x: number; animate: boolean } | null;
+  locked?: boolean;
 }) {
   const [draft, setDraft] = useState("");
   const [composer, setComposer] = useState<"tag" | "folder" | null>(null);
@@ -349,18 +353,34 @@ export function TagRail({
     );
   };
 
-  if (!open) {
+  if (!open && !slide) {
     return (
-      <aside className="tag-rail is-collapsed" aria-label="タグ">
-        <Button variant="quiet" aria-label="タグを表示" onClick={onToggle}>
-          <PanelRightOpen className="size-4" aria-hidden="true" />
+      <aside className={locked ? "tag-rail is-collapsed is-locked" : "tag-rail is-collapsed"} aria-label="タグ">
+        <Button
+          variant="quiet"
+          aria-label={locked ? "拡大表示中はタグを開けません" : "タグを表示"}
+          aria-disabled={locked || undefined}
+          onClick={() => {
+            if (!locked) onToggle();
+          }}
+        >
+          {locked ? <Ban className="size-4" aria-hidden="true" /> : <PanelRightOpen className="size-4" aria-hidden="true" />}
+          {locked ? null : <span className="rail-reveal-label">タグ</span>}
         </Button>
       </aside>
     );
   }
 
   return (
-    <aside className="tag-rail" style={{ width }} aria-label="タグ">
+    <aside
+      className="tag-rail"
+      style={{
+        width,
+        transform: slide ? `translate3d(${slide.x}px,0,0)` : undefined,
+        transition: slide ? (slide.animate ? "transform 220ms ease-out" : "none") : undefined,
+      }}
+      aria-label="タグ"
+    >
       <div className="tag-rail-head">
         <Button variant="quiet" aria-label="タグをしまう" onClick={onToggle}>
           <PanelRightClose className="size-4" aria-hidden="true" />

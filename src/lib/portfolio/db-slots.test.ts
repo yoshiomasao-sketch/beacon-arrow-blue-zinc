@@ -367,7 +367,7 @@ describe("library slots", { concurrency: false }, () => {
       } as unknown as IDBDatabase,
       backup,
     );
-    assert.deepEqual(seen, ["imageMeta", "imageBlobs", "folders", "folderViews", "tags", "tagFolders", "kv"]);
+    assert.deepEqual(seen, ["imageMeta", "imageBlobs", "imageInk", "folders", "folderViews", "tags", "tagFolders", "kv"]);
     deleted.length = 0;
     opened.length = 0;
     await replaceLibrary(backup);
@@ -419,7 +419,7 @@ describe("library slots", { concurrency: false }, () => {
     await resetLiveLibrary("komacho-2", backup);
     assert.deepEqual(opened, ["komacho-2"]);
     assert.deepEqual(deleted, []);
-    assert.equal(ops.filter((line) => line.endsWith(":clear")).length, 7);
+    assert.equal(ops.filter((line) => line.endsWith(":clear")).length, 8);
     assert.ok(ops.includes("komacho-2:folders:put:fresh"));
     assert.equal(ops.some((line) => line.startsWith("komacho:") || line.startsWith("komacho-3:")), false);
     assert.equal(memory.get("komacho-library-db-2"), "komacho-2");

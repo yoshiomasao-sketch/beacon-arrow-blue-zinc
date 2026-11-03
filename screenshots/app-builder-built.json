@@ -7,9 +7,9 @@
       "status": 200,
       "title": "ポートフォリオΔ",
       "hasCanvas": false,
-      "bodyTextLen": 262,
-      "bodyTextHash": "f343abc3d523f8b2c11aac97034b29d152607fa36888f3cd2bc9b3aebc432ac7",
-      "bodyTextPrefix": "フォルダ 作成 コピーフォルダ貼りつけ すべての画像 0 未分類 0 ファイル一覧 このフォルダにファイルはありません タブ 1",
+      "bodyTextLen": 292,
+      "bodyTextHash": "acf1da62d76b049e2540a2dea1aa4a0a08f6f7fdc6b02552fac2041538090305",
+      "bodyTextPrefix": "フォルダ 作成 コピーフォルダ 貼りつけ すべての画像 0 未分類 0 ファイル一覧 このフォルダにファイルはありません タブ ",
       "horizontalOverflow": false,
       "consoleErrors": [],
       "pageErrors": [],
@@ -21,9 +21,9 @@
       "status": 200,
       "title": "ポートフォリオΔ",
       "hasCanvas": false,
-      "bodyTextLen": 116,
-      "bodyTextHash": "46f6ba407d085dd2a120b4ffb3ff531d0ab8dfcad23dde8901703da3e137a7c3",
-      "bodyTextPrefix": "お気に入りのみ バックアップを保存 バックアップから復元 現在のタブを初期化 スライドショー 選択タグ すべて一致すべて外す タ",
+      "bodyTextLen": 111,
+      "bodyTextHash": "5e59527b72b2163c17dc96bea02cabf211e75dfddc5e32a94b3a33e05ad8b201",
+      "bodyTextPrefix": "お気に入りのみ 保存 復元 スライドショー シャッフル 日付順でソート アニメ▶️ 選択タグ すべて一致すべて外す タグを選ぶと",
       "horizontalOverflow": false,
       "consoleErrors": [],
       "pageErrors": [],
@@ -33,9 +33,6 @@
   "brandWarnings": [],
   "authWarnings": [],
   "verdictFile": "/workspace/screenshots/app-builder-built.json",
-  "divergesFromBaseline": true,
-  "baselineReasons": [
-    "desktop: body text replaced (similar length, page start changed)",
-    "mobile: body text changed (217 -> 116 chars, hash mismatch)"
-  ]
+  "divergesFromBaseline": false,
+  "baselineReasons": []
 }

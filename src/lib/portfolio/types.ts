@@ -33,6 +33,8 @@ export type ImageMeta = {
   animated: boolean;
   /** Short note kept with this image. Empty when unset. */
   memo: string;
+  /** False hides the pen layer only. Missing means shown. */
+  inkVisible?: boolean;
 };
 
 export type Tag = {

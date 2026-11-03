@@ -1,6 +1,7 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { ChevronLeft, ChevronRight, Heart } from "lucide-react";
+import { ChevronLeft, ChevronRight, Eye, EyeOff, Heart, Pencil } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { ImageInk } from "@/components/portfolio/ink-layer";
 import { Button } from "@/components/ui/button";
 import { readPixels } from "@/lib/portfolio/db";
 import {
@@ -33,6 +34,7 @@ import {
   type Zoom,
 } from "@/lib/portfolio/lightbox-zoom";
 import type { ImageMeta, Tag } from "@/lib/portfolio/types";
+import { setInkVisible, usePortfolio } from "@/lib/portfolio/store";
 
 type Frame = { left: number; top: number; width: number; height: number };
 
@@ -116,6 +118,9 @@ export function Lightbox({
   onStep,
   onToggleFavorite,
   tags = [],
+  launchInk = null,
+  contained = false,
+  container = null,
 }: {
   item: ImageMeta | null;
   index: number;
@@ -126,6 +131,9 @@ export function Lightbox({
   onStep: (delta: number) => void;
   onToggleFavorite: (id: string) => void;
   tags?: Tag[];
+  launchInk?: { current: boolean } | null;
+  contained?: boolean;
+  container?: HTMLElement | null;
 }) {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
@@ -134,7 +142,24 @@ export function Lightbox({
   const [frame, setFrame] = useState<Frame | null>(null);
   const [stageBox, setStageBox] = useState({ width: 0, height: 0 });
   const [hot, setHot] = useState<"prev" | "next" | null>(null);
-  const [phone, setPhone] = useState(false);
+  const [phone, setPhone] = useState(() => typeof window !== "undefined" && window.matchMedia("(max-width: 899px)").matches);
+  const [inkOn, setInkOn] = useState(false);
+  const [inkDock, setInkDock] = useState<HTMLDivElement | null>(null);
+  const hasInk = usePortfolio((state) => (item && !item.animated ? state.inkIds.includes(item.id) : false));
+  const inkShown = item?.inkVisible !== false;
+  const canInk = Boolean(item && !phone && !item.animated);
+  const editing = canInk && (inkOn || Boolean(launchInk?.current));
+  useEffect(() => {
+    if (!item || phone || item.animated) {
+      if (launchInk) launchInk.current = false;
+      setInkOn(false);
+      return;
+    }
+    if (launchInk?.current) {
+      launchInk.current = false;
+      setInkOn(true);
+    }
+  }, [item, phone, launchInk]);
   const [zoom, setZoom] = useState<Zoom>(IDENTITY_ZOOM);
   const [zoomAnim, setZoomAnim] = useState(false);
   const [drag, setDrag] = useState<Drag>(DRAG_REST);
@@ -296,6 +321,12 @@ export function Lightbox({
   }, [measure]);
 
   useEffect(() => {
+    measure();
+    const frameId = window.requestAnimationFrame(measure);
+    return () => window.cancelAnimationFrame(frameId);
+  }, [editing, measure]);
+
+  useEffect(() => {
     const media = window.matchMedia("(max-width: 899px)");
     const apply = () => {
       phoneRef.current = media.matches;
@@ -370,6 +401,23 @@ export function Lightbox({
     window.cancelAnimationFrame(dragFrame.current);
     onStep(delta);
   };
+  const stepRef = useRef(step);
+  stepRef.current = step;
+
+  useEffect(() => {
+    if (!contained || !item) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.altKey || event.metaKey || event.ctrlKey) return;
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      const target = event.target;
+      if (target instanceof HTMLElement && target.closest("input, textarea, select, [contenteditable='true']")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      stepRef.current(event.key === "ArrowRight" ? 1 : -1);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [contained, item]);
 
   useEffect(() => {
     if (!settleEnter.current) return;
@@ -767,10 +815,20 @@ export function Lightbox({
     incomingItem && incomingUrl ? containedFrame(stageBox.width, stageBox.height, incomingItem.width, incomingItem.height, 16) : null;
   const incomingShift = Math.abs(shownDrag.x) > 0.5 ? incomingX(shownDrag.x, stageBox.width) : parkedX(slideDir.current === -1 ? -1 : 1, stageBox.width);
   const scrim = phone ? Math.min(scrimForDrag(shownDrag.y, stageBox.height), scrimForPinch(pinchFades, shown.scale)) : 1;
+  if (contained && !container) return null;
 
   return (
-    <Dialog.Root open={item !== null} onOpenChange={(open) => !open && onClose()}>
-      <Dialog.Portal>
+    <Dialog.Root open={item !== null} modal={!contained} onOpenChange={(open) => !open && onClose()}>
+      <Dialog.Portal container={contained ? container ?? undefined : undefined}>
+        {contained ? (
+          <div
+            className="lightbox-overlay"
+            onPointerDown={(event) => {
+              event.stopPropagation();
+              onClose();
+            }}
+          />
+        ) : (
         <Dialog.Overlay
           className="lightbox-overlay"
           style={
@@ -783,13 +841,24 @@ export function Lightbox({
               : undefined
           }
         />
+        )}
         <Dialog.Content
           ref={contentRef}
-          className={phone ? "lightbox-content is-phone" : "lightbox-content"}
+          className={[phone ? "lightbox-content is-phone" : "lightbox-content", editing ? "is-inking" : "", contained ? "is-docked" : ""].filter(Boolean).join(" ")}
           onCloseAutoFocus={(event) => {
             event.preventDefault();
           }}
+          onInteractOutside={(event) => {
+            if (contained) event.preventDefault();
+          }}
+          onPointerDownOutside={(event) => {
+            if (contained) event.preventDefault();
+          }}
+          onFocusOutside={(event) => {
+            if (contained) event.preventDefault();
+          }}
           onPointerDown={(event) => {
+            if (editing && event.target instanceof Element && event.target.closest(".ink-layer, .ink-select-host, .ink-tools, .ink-dock")) return;
             if (viewerPhone()) beginPhone(event);
           }}
           onPointerMove={(event) => {
@@ -835,6 +904,7 @@ export function Lightbox({
                 ref={bindStage}
                 className="lightbox-stage"
                 onPointerDown={(event) => {
+                  if (editing) return;
                   suppressClick.current = false;
                   if (viewerPhone()) return;
                   beginSwipe(event);
@@ -899,7 +969,18 @@ export function Lightbox({
                 ) : (
                   <p className="text-sm text-paper">{failed ? "プレビューを開けませんでした。" : "読み込み中"}</p>
                 )}
-                {frame ? (
+                {frame && item && !item.animated ? (
+                  <ImageInk
+                    imageId={item.id}
+                    pixelWidth={Math.max(1, item.width)}
+                    pixelHeight={Math.max(1, item.height)}
+                    live={editing}
+                    shown={inkShown || editing}
+                    toolsRoot={inkDock}
+                    style={mediaStyle(frame, shown, phone, zoomAnim && sameImage, phone ? shownDrag : DRAG_REST, dragAnim && sameImage)}
+                  />
+                ) : null}
+                {frame && !editing ? (
                   <div className="lightbox-hit" style={{ left: frame.left, top: frame.top, width: frame.width, height: frame.height }}>
                     <button
                       type="button"
@@ -960,6 +1041,7 @@ export function Lightbox({
                   </section>
                 ) : null}
               </div>
+              {editing ? <div ref={setInkDock} className="ink-dock" /> : null}
               <div className="lightbox-nav">
                 {total > 1 ? (
                   <Button variant="quiet" onClick={() => step(-1)} disabled={!canPrev}>
@@ -968,15 +1050,70 @@ export function Lightbox({
                 ) : (
                   <span />
                 )}
-                <Button
-                  variant="quiet"
-                  className={item.favorite ? "lightbox-fav is-on" : "lightbox-fav"}
-                  aria-label={item.favorite ? `${item.name}のお気に入りを解除` : `${item.name}をお気に入りに追加`}
-                  aria-pressed={item.favorite}
-                  onClick={() => onToggleFavorite(item.id)}
-                >
-                  <Heart aria-hidden="true" fill={item.favorite ? "currentColor" : "none"} />
-                </Button>
+                <div className="lightbox-nav-mid">
+                  {phone ? (
+                    hasInk ? (
+                      <span className="ink-pair">
+                        <span className="ink-status" aria-label="ペン書き込みあり">
+                          <Pencil aria-hidden="true" />
+                        </span>
+                        <Button
+                          variant="quiet"
+                          className={editing ? "lightbox-fav is-ink-locked" : inkShown ? "lightbox-fav is-ink-on" : "lightbox-fav"}
+                          aria-label={editing ? "編集中は表示を切り替えられません" : inkShown ? "書き込みを隠す" : "書き込みを表示"}
+                          aria-pressed={editing ? true : inkShown}
+                          disabled={editing}
+                          onClick={() => {
+                            if (editing) return;
+                            void setInkVisible(item.id, !inkShown);
+                          }}
+                        >
+                          {editing || inkShown ? <Eye aria-hidden="true" /> : <EyeOff aria-hidden="true" />}
+                        </Button>
+                      </span>
+                    ) : (
+                      <span />
+                    )
+                  ) : item.animated ? (
+                    <span />
+                  ) : (
+                    <span className={hasInk ? "ink-pair" : "ink-pair is-single"}>
+                      <Button
+                        variant="quiet"
+                        className={editing ? "lightbox-fav is-on" : "lightbox-fav"}
+                        aria-label={editing ? "ペン書き込みを終了" : "ペン書き込み"}
+                        aria-pressed={editing}
+                        onClick={() => setInkOn((current) => !current)}
+                      >
+                        <Pencil aria-hidden="true" />
+                      </Button>
+                      {hasInk ? (
+                        <Button
+                          variant="quiet"
+                          className={editing ? "lightbox-fav is-ink-locked" : inkShown ? "lightbox-fav is-ink-on" : "lightbox-fav"}
+                          aria-label={editing ? "編集中は表示を切り替えられません" : inkShown ? "書き込みを隠す" : "書き込みを表示"}
+                          aria-pressed={editing ? true : inkShown}
+                          disabled={editing}
+                          onClick={() => {
+                            if (editing) return;
+                            void setInkVisible(item.id, !inkShown);
+                          }}
+                        >
+                          {editing || inkShown ? <Eye aria-hidden="true" /> : <EyeOff aria-hidden="true" />}
+                        </Button>
+                      ) : null}
+                    </span>
+                  )}
+                  <Button
+                    variant="quiet"
+                    className={item.favorite ? "lightbox-fav is-on" : "lightbox-fav"}
+                    aria-label={item.favorite ? `${item.name}のお気に入りを解除` : `${item.name}をお気に入りに追加`}
+                    aria-pressed={item.favorite}
+                    onClick={() => onToggleFavorite(item.id)}
+                  >
+                    <Heart aria-hidden="true" fill={item.favorite ? "currentColor" : "none"} />
+                  </Button>
+                </div>
                 {total > 1 ? (
                   <Button variant="quiet" onClick={() => step(1)} disabled={!canNext}>
                     次へ

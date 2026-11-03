@@ -32,6 +32,8 @@ export function FolderRail({
   onPane,
   onJump,
   viewer = false,
+  slide = null,
+  locked = false,
 }: {
   folders: Folder[];
   items: ImageMeta[];
@@ -58,6 +60,8 @@ export function FolderRail({
   onPane: (height: number) => void;
   onJump: (id: string) => void;
   viewer?: boolean;
+  slide?: { x: number; animate: boolean } | null;
+  locked?: boolean;
 }) {
   const [draft, setDraft] = useState("");
   const [creating, setCreating] = useState(false);
@@ -237,11 +241,19 @@ export function FolderRail({
     });
   }, [selected]);
 
-  if (!open) {
+  if (!open && !slide) {
     return (
-      <aside className="folder-rail is-collapsed" aria-label="フォルダ">
-        <Button variant="quiet" aria-label="フォルダを表示" onClick={onToggle}>
-          <PanelLeftOpen className="size-4" aria-hidden="true" />
+      <aside className={locked ? "folder-rail is-collapsed is-locked" : "folder-rail is-collapsed"} aria-label="フォルダ">
+        <Button
+          variant="quiet"
+          aria-label={locked ? "拡大表示中はフォルダを開けません" : "フォルダを表示"}
+          aria-disabled={locked || undefined}
+          onClick={() => {
+            if (!locked) onToggle();
+          }}
+        >
+          {locked ? <Ban className="size-4" aria-hidden="true" /> : <PanelLeftOpen className="size-4" aria-hidden="true" />}
+          {locked ? null : <span className="rail-reveal-label">フォルダ</span>}
         </Button>
       </aside>
     );
@@ -255,7 +267,16 @@ export function FolderRail({
   const ancestors = current ? folderAncestors(folders, current.id) : [];
 
   return (
-    <aside ref={railRef} className="folder-rail" style={{ width }} aria-label="フォルダ">
+    <aside
+      ref={railRef}
+      className="folder-rail"
+      style={{
+        width,
+        transform: slide ? `translate3d(${slide.x}px,0,0)` : undefined,
+        transition: slide ? (slide.animate ? "transform 220ms ease-out" : "none") : undefined,
+      }}
+      aria-label="フォルダ"
+    >
       <div className="folder-pane" style={{ height: pane }}>
       <div className="folder-rail-head">
         <h2>フォルダ</h2>

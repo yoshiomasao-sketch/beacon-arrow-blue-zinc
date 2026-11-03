@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { isCanvasInkId } from "@/lib/portfolio/canvas";
 import {
   activeLibraryTab,
   allocateOrders,
@@ -19,6 +20,7 @@ import {
   readFolderCopySource,
   listFolderViews,
   listMeta,
+  listInkIds,
   listTagFolders,
   listTags,
   normalizeLibraryTab,
@@ -68,6 +70,7 @@ import { releaseAllOriginals, releaseOriginal } from "./export-file.ts";
 import { emptyLibraryBackup } from "./backup.ts";
 import { ImagePrepareError, prepareImage } from "./prepare.ts";
 import { forgetAllThumbs, forgetThumb } from "./thumbs.ts";
+import { clearInkHistories } from "./ink.ts";
 import { ALL_FOLDERS, DEFAULT_FOLDER_VIEW, TAG_COLORS, type DisplayScale, type Folder, type FolderView, type ImageMeta, type ImageSource, type Tag, type TagFolder } from "./types.ts";
 
 export type PendingAdd = {
@@ -106,8 +109,14 @@ export type PortfolioState = {
   tagMatch: TagMatch;
   tagOpen: boolean;
   tagWidth: number;
+  /** Gallery's share of the canvas-mode center, not including the side rails. */
+  canvasSplit: number;
   pendingAdd: PendingAdd | null;
   libraryEpoch: number;
+  /** Image ids that currently have a pen layer. */
+  inkIds: string[];
+  /** Bumps when a pen layer is saved so the gallery overlay reloads that id. */
+  inkRev: Record<string, number>;
 };
 
 const SERVER_SNAPSHOT: PortfolioState = {
@@ -133,8 +142,11 @@ const SERVER_SNAPSHOT: PortfolioState = {
   tagMatch: "all",
   tagOpen: true,
   tagWidth: 220,
+  canvasSplit: 0.5,
   pendingAdd: null,
   libraryEpoch: 0,
+  inkIds: [],
+  inkRev: {},
 };
 
 let state: PortfolioState = SERVER_SNAPSHOT;
@@ -225,7 +237,8 @@ function isQuota(error: unknown): boolean {
 }
 
 async function loadLibraryIntoState(epoch: number): Promise<void> {
-  const [items, folder, width, open, pane, favoritesOnly, tags, tag, tagHidden, tagMatch, tagOpen, tagWidth, tagFolders, folderHidden] = await Promise.all([
+  clearInkHistories();
+  const [items, folder, width, open, pane, favoritesOnly, tags, tag, tagHidden, tagMatch, tagOpen, tagWidth, tagFolders, folderHidden, inkIdList, canvasSplit] = await Promise.all([
     listMeta(),
     readKvString("folder", ALL_FOLDERS),
     readKv("folderWidth", 240),
@@ -240,6 +253,8 @@ async function loadLibraryIntoState(epoch: number): Promise<void> {
     readKv("tagWidth", 220),
     listTagFolders(),
     readKvString("folderHidden", ""),
+    listInkIds(),
+    readKv("canvasSplit", 0.5),
   ]);
   if (epoch !== viewEpoch) return;
   const library = await ensureLibrary(items);
@@ -303,11 +318,14 @@ async function loadLibraryIntoState(epoch: number): Promise<void> {
     tagMatch: normalizeTagMatch(tagMatch),
     tagOpen: tagOpen !== 0,
     tagWidth: Math.min(320, Math.max(180, tagWidth || 220)),
+    canvasSplit: canvasSplit > 0 && canvasSplit < 1 ? canvasSplit : 0.5,
     columns: active.columns,
     direction: active.direction,
     bootError: null,
     pendingAdd: null,
     importing: null,
+    inkIds: inkIdList.filter((id) => cleaned.some((item) => item.id === id)),
+    inkRev: {},
   }));
 }
 
@@ -391,9 +409,12 @@ async function applyRetarget(ticket: number): Promise<void> {
       folderOpen: true,
       tagOpen: true,
       tagWidth: 220,
+      canvasSplit: 0.5,
       pendingAdd: null,
       importing: null,
       bootError: null,
+      inkIds: [],
+      inkRev: {},
     }));
     await loadLibraryIntoState(ticket);
   } catch (error) {
@@ -720,6 +741,40 @@ export async function setImageMemo(id: string, memo: string): Promise<void> {
     setState((current) => ({ ...current, items: previous }));
     pushNotice(storageErrorMessage(error, "save"));
   }
+}
+
+/** Shows or hides one image's pen layer. The drawing itself is left in place. */
+export async function setInkVisible(id: string, visible: boolean): Promise<void> {
+  if (!userWritesOpen()) return;
+  const item = state.items.find((entry) => entry.id === id);
+  if (!item) return;
+  if ((item.inkVisible !== false) === visible) return;
+  const next = { ...item, inkVisible: visible };
+  const previous = state.items;
+  setState((current) => ({
+    ...current,
+    items: current.items.map((entry) => (entry.id === id ? next : entry)),
+  }));
+  try {
+    await putMeta(next);
+  } catch (error) {
+    setState((current) => ({ ...current, items: previous }));
+    pushNotice(storageErrorMessage(error, "save"));
+  }
+}
+
+/** Gallery learns that a pen layer was saved or removed. Does not touch the pixels. */
+export function noteInkPresence(id: string, present: boolean): void {
+  if (!id || isCanvasInkId(id)) return;
+  setState((current) => {
+    const has = current.inkIds.includes(id);
+    const inkIds = present ? (has ? current.inkIds : [...current.inkIds, id]) : has ? current.inkIds.filter((entry) => entry !== id) : current.inkIds;
+    return {
+      ...current,
+      inkIds,
+      inkRev: { ...current.inkRev, [id]: (current.inkRev[id] ?? 0) + 1 },
+    };
+  });
 }
 
 function tagTaken(name: string, exceptId?: string): boolean {
@@ -1193,8 +1248,8 @@ export function placeImageBefore(sourceId: string, targetId: string): void {
   setState((current) => ({ ...current, items: withOrders(current.items, ids) }));
 }
 
-export async function commitImageOrder(): Promise<void> {
-  if (viewerLock || !userWritesOpen()) return;
+export async function commitImageOrder(force = false): Promise<void> {
+  if ((!force && viewerLock) || !userWritesOpen()) return;
   const key = orderKey(state.items);
   if (key === persistedKey) return;
   const snapshot = state.items;
@@ -1233,8 +1288,8 @@ export async function setImageScale(id: string, scale: DisplayScale): Promise<vo
   }
 }
 
-export function setVisibleOrder(ids: string[]): void {
-  if (viewerLock || !userWritesOpen()) return;
+export function setVisibleOrder(ids: string[], force = false): void {
+  if ((!force && viewerLock) || !userWritesOpen()) return;
   const next = assignVisibleOrders(state.items, ids);
   if (!next) return;
   setState((current) => ({ ...current, items: next }));
@@ -1792,6 +1847,18 @@ export async function moveImageToFolder(id: string, folderId: string): Promise<v
   } catch (error) {
     setState((current) => ({ ...current, items: previous }));
     persistedKey = orderKey(previous);
+    pushNotice(storageErrorMessage(error, "save"));
+  }
+}
+
+export async function saveCanvasSplit(share: number): Promise<void> {
+  if (viewerLock || !userWritesOpen()) return;
+  const next = Math.round(share * 10000) / 10000;
+  if (!Number.isFinite(next) || next <= 0 || next >= 1) return;
+  setState((current) => ({ ...current, canvasSplit: next }));
+  try {
+    await writeKv("canvasSplit", next);
+  } catch (error) {
     pushNotice(storageErrorMessage(error, "save"));
   }
 }

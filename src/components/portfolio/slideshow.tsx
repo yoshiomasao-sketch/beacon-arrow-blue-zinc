@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Button } from "@/components/ui/button";
 import { readPixels } from "@/lib/portfolio/db";
@@ -19,10 +19,16 @@ export function Slideshow({
   open,
   items,
   onOpenChange,
+  container = null,
+  dock = false,
+  anchor = null,
 }: {
   open: boolean;
   items: ImageMeta[];
   onOpenChange: (open: boolean) => void;
+  container?: HTMLElement | null;
+  dock?: boolean;
+  anchor?: HTMLElement | null;
 }) {
   const [order, setOrder] = useState<SlideshowOrder>("sequence");
   const [seconds, setSeconds] = useState(5);
@@ -48,6 +54,8 @@ export function Slideshow({
   if (!open || typeof document === "undefined") return null;
 
   if (play) {
+    if (dock && !container) return null;
+    const host = container ?? document.body;
     return createPortal(
       <SlideshowPlayer
         items={play.items}
@@ -55,9 +63,10 @@ export function Slideshow({
         seconds={play.seconds}
         showClock={play.showClock}
         zoom={play.zoom}
+        docked={dock}
         onClose={() => onOpenChange(false)}
       />,
-      document.body,
+      host,
     );
   }
 
@@ -72,13 +81,106 @@ export function Slideshow({
   };
 
   return createPortal(
-    <div className="slideshow-setup" onPointerDown={() => onOpenChange(false)}>
+    <SlideshowSetup
+      anchor={anchor}
+      order={order}
+      seconds={seconds}
+      showClock={showClock}
+      zoom={zoom}
+      onOrder={setOrder}
+      onSeconds={setSeconds}
+      onShowClock={setShowClock}
+      onZoom={setZoom}
+      onClose={() => onOpenChange(false)}
+      onStart={start}
+    />,
+    document.body,
+  );
+}
+
+function SlideshowSetup({
+  anchor,
+  order,
+  seconds,
+  showClock,
+  zoom,
+  onOrder,
+  onSeconds,
+  onShowClock,
+  onZoom,
+  onClose,
+  onStart,
+}: {
+  anchor: HTMLElement | null;
+  order: SlideshowOrder;
+  seconds: number;
+  showClock: boolean;
+  zoom: boolean;
+  onOrder: (order: SlideshowOrder) => void;
+  onSeconds: (seconds: number) => void;
+  onShowClock: (shown: boolean) => void;
+  onZoom: (zoom: boolean) => void;
+  onClose: () => void;
+  onStart: () => void;
+}) {
+  const cardRef = useRef<HTMLDivElement>(null);
+  const secondsRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [secondsOpen, setSecondsOpen] = useState(false);
+  const [menuMax, setMenuMax] = useState(240);
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+
+  useLayoutEffect(() => {
+    const place = () => {
+      const node = cardRef.current;
+      if (!node) return;
+      const box = node.getBoundingClientRect();
+      const rect = anchor?.getBoundingClientRect();
+      const margin = 8;
+      const gap = 4;
+      let top = rect ? rect.bottom + gap : Math.max(margin, (window.innerHeight - box.height) / 2);
+      let left = rect ? rect.left : Math.max(margin, (window.innerWidth - box.width) / 2);
+      if (left + box.width > window.innerWidth - margin) left = window.innerWidth - margin - box.width;
+      if (left < margin) left = margin;
+      if (top + box.height > window.innerHeight - margin) top = Math.max(margin, window.innerHeight - margin - box.height);
+      if (top < margin) top = margin;
+      setPos((current) => (current && current.top === top && current.left === left ? current : { top, left }));
+    };
+    place();
+    window.addEventListener("resize", place);
+    return () => window.removeEventListener("resize", place);
+  }, [anchor]);
+
+  useLayoutEffect(() => {
+    if (!secondsOpen) return;
+    const menu = menuRef.current;
+    if (!menu) return;
+    const top = menu.getBoundingClientRect().top;
+    setMenuMax(Math.max(40, window.innerHeight - top - 8));
+    const chosen = menu.querySelector("[aria-selected='true']");
+    if (!(chosen instanceof HTMLElement)) return;
+    const start = chosen.offsetTop;
+    const end = start + chosen.offsetHeight;
+    if (start < menu.scrollTop) menu.scrollTop = start;
+    else if (end > menu.scrollTop + menu.clientHeight) menu.scrollTop = end - menu.clientHeight;
+  }, [secondsOpen, pos]);
+
+  return (
+    <div className="slideshow-setup is-anchored" onClick={onClose}>
       <div
+        ref={cardRef}
         className="slideshow-setup-card"
         role="dialog"
         aria-modal="true"
         aria-labelledby="slideshow-title"
-        onPointerDown={(event) => event.stopPropagation()}
+        style={pos ? { top: pos.top, left: pos.left } : { top: -9999, left: 0 }}
+        onClick={(event) => event.stopPropagation()}
+        onPointerDown={(event) => {
+          event.stopPropagation();
+          const target = event.target;
+          if (target instanceof Node && secondsRef.current?.contains(target)) return;
+          setSecondsOpen(false);
+        }}
       >
         <div>
           <h2 id="slideshow-title" className="m-0 text-base font-medium">
@@ -89,45 +191,69 @@ export function Slideshow({
         <div>
           <p className="m-0 text-sm">画像の順番</p>
           <div className="slideshow-choices" role="group" aria-label="画像の順番">
-            <Button variant={order === "sequence" ? "primary" : "quiet"} aria-pressed={order === "sequence"} onClick={() => setOrder("sequence")}>
+            <Button variant={order === "sequence" ? "primary" : "quiet"} aria-pressed={order === "sequence"} onClick={() => onOrder("sequence")}>
               順番どおり
             </Button>
-            <Button variant={order === "random" ? "primary" : "quiet"} aria-pressed={order === "random"} onClick={() => setOrder("random")}>
+            <Button variant={order === "random" ? "primary" : "quiet"} aria-pressed={order === "random"} onClick={() => onOrder("random")}>
               ランダム
             </Button>
           </div>
         </div>
-        <label className="text-sm">
+        <div className="text-sm">
           切り替え間隔
-          <select
-            aria-label="切り替え間隔"
-            value={seconds}
-            onChange={(event) => setSeconds(clampSlideSeconds(Number(event.target.value)))}
-          >
-            {Array.from({ length: 60 }, (_, index) => index + 1).map((value) => (
-              <option key={value} value={value}>
-                {value}秒
-              </option>
-            ))}
-          </select>
-        </label>
+          <div className="slideshow-seconds" ref={secondsRef}>
+            <button
+              type="button"
+              aria-label="切り替え間隔"
+              aria-haspopup="listbox"
+              aria-expanded={secondsOpen}
+              onClick={() => {
+                setSecondsOpen((open) => {
+                  if (open) return false;
+                  const rect = secondsRef.current?.getBoundingClientRect();
+                  if (rect) setMenuMax(Math.max(40, window.innerHeight - rect.bottom - 10));
+                  return true;
+                });
+              }}
+            >
+              {seconds}秒
+            </button>
+            {secondsOpen ? (
+              <div ref={menuRef} className="slideshow-seconds-menu" role="listbox" aria-label="切り替え間隔" style={{ maxHeight: menuMax }}>
+                {Array.from({ length: 60 }, (_, index) => index + 1).map((value) => (
+                  <button
+                    key={value}
+                    type="button"
+                    role="option"
+                    aria-selected={value === seconds}
+                    onClick={() => {
+                      onSeconds(clampSlideSeconds(value));
+                      setSecondsOpen(false);
+                    }}
+                  >
+                    {value}秒
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        </div>
         <label className="slideshow-clock-option">
-          <input type="checkbox" checked={zoom} onChange={(event) => setZoom(event.target.checked)} />
+          <input type="checkbox" checked={zoom} onChange={(event) => onZoom(event.target.checked)} />
           ゆっくり拡大する
         </label>
         <label className="slideshow-clock-option">
-          <input type="checkbox" checked={showClock} onChange={(event) => setShowClock(event.target.checked)} />
+          <input type="checkbox" checked={showClock} onChange={(event) => onShowClock(event.target.checked)} />
           切り替えまでの秒数を表示
         </label>
         <div className="slideshow-actions">
-          <Button variant="quiet" onClick={() => onOpenChange(false)}>
+          <Button variant="quiet" onClick={onClose}>
             キャンセル
           </Button>
-          <Button onClick={start}>開始</Button>
+          <Button onClick={onStart}>開始</Button>
         </div>
       </div>
-    </div>,
-    document.body,
+    </div>
   );
 }
 
@@ -137,6 +263,7 @@ function SlideshowPlayer({
   seconds,
   showClock,
   zoom,
+  docked = false,
   onClose,
 }: {
   items: ImageMeta[];
@@ -144,10 +271,13 @@ function SlideshowPlayer({
   seconds: number;
   showClock: boolean;
   zoom: boolean;
+  docked?: boolean;
   onClose: () => void;
 }) {
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+  const dockedRef = useRef(docked);
+  dockedRef.current = docked;
   const [layers, setLayers] = useState<Array<{ token: number; url: string; on: boolean }>>([]);
   const [remaining, setRemaining] = useState(seconds);
   const tokenRef = useRef(0);
@@ -163,8 +293,6 @@ function SlideshowPlayer({
     let failures = 0;
     let cursor: SlideshowCursor = startDeck(items.length, order);
     let pending: SlideshowCursor | null = null;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
 
     const urlFor = async (id: string) => {
       const cached = urls.get(id);
@@ -230,6 +358,10 @@ function SlideshowPlayer({
     void show(cursor.deck[cursor.at] ?? 0);
 
     const onKey = (event: KeyboardEvent) => {
+      if (dockedRef.current) {
+        const target = event.target;
+        if (target instanceof Node && document.querySelector(".canvas-pane")?.contains(target)) return;
+      }
       event.preventDefault();
       event.stopPropagation();
       if (event.key === "Escape") onCloseRef.current();
@@ -241,10 +373,18 @@ function SlideshowPlayer({
       window.clearTimeout(timer);
       window.cancelAnimationFrame(reveal);
       window.removeEventListener("keydown", onKey, true);
-      document.body.style.overflow = previousOverflow;
       for (const url of urls.values()) URL.revokeObjectURL(url);
     };
   }, [items, order, seconds]);
+
+  useEffect(() => {
+    if (docked) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [docked]);
 
   useEffect(() => {
     if (!showClock) return;

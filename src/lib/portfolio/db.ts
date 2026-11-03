@@ -2,6 +2,7 @@ import { descendantFolderIds, normalizeFolderView, normalizeFolders, normalizeMe
 import type { AppStorageUsage, BrowserStorageUsage, StorageSnapshot } from "./storage-usage.ts";
 import type { Folder, FolderView, ImageMeta, Tag, TagFolder } from "./types.ts";
 import type { BackupSetting, BackupView, LibraryDump, ParsedBackup } from "./backup.ts";
+import { CANVAS_BOARD_ID, CANVAS_FLAT_PREFIX, CANVAS_PLACEMENTS_KEY, canvasFlatId, isCanvasInkId, parsePlacements } from "./canvas.ts";
 import { batchImageIndexes, RestoreFailure } from "./backup.ts";
 
 /**
@@ -10,7 +11,7 @@ import { batchImageIndexes, RestoreFailure } from "./backup.ts";
  * localStorage is intentionally unused — image bodies must not go there.
  */
 
-const DB_VERSION = 5;
+const DB_VERSION = 6;
 
 /** Tab 1 keeps the original names. Tabs 2 and 3 have their own swap pairs. */
 const TAB_SLOTS = {
@@ -189,6 +190,11 @@ type BlobRow = {
   thumb: Blob | null;
 };
 
+type InkRow = {
+  id: string;
+  png: Blob;
+};
+
 type KvRow = {
   key: string;
   value: number | string;
@@ -264,6 +270,9 @@ function upgradeLibrary(db: IDBDatabase): void {
   }
   if (!db.objectStoreNames.contains("tagFolders")) {
     db.createObjectStore("tagFolders", { keyPath: "id" });
+  }
+  if (!db.objectStoreNames.contains("imageInk")) {
+    db.createObjectStore("imageInk", { keyPath: "id" });
   }
 }
 
@@ -379,12 +388,96 @@ export function deleteImage(id: string): Promise<void> {
   return getDb().then(
     (db) =>
       new Promise((resolve, reject) => {
-        const tx = openWrite(db, ["imageMeta", "imageBlobs"]);
+        const tx = openWrite(db, ["imageMeta", "imageBlobs", "imageInk"]);
         tx.objectStore("imageMeta").delete(id);
         tx.objectStore("imageBlobs").delete(id);
+        tx.objectStore("imageInk").delete(id);
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error ?? new Error("delete failed"));
         tx.onabort = () => reject(tx.error ?? new Error("delete aborted"));
+      }),
+  );
+}
+
+export function readInk(id: string): Promise<Blob | null> {
+  return getDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction("imageInk", "readonly");
+        const req = tx.objectStore("imageInk").get(id);
+        req.onsuccess = () => {
+          const row = req.result as InkRow | undefined;
+          resolve(row?.png instanceof Blob && row.png.size > 0 ? row.png : null);
+        };
+        req.onerror = () => reject(req.error ?? new Error("ink read failed"));
+      }),
+  );
+}
+
+export function saveInk(id: string, png: Blob): Promise<void> {
+  return getDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = openWrite(db, "imageInk");
+        tx.objectStore("imageInk").put({ id, png } satisfies InkRow);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error ?? new Error("ink save failed"));
+        tx.onabort = () => reject(tx.error ?? new Error("ink save aborted"));
+      }),
+  );
+}
+
+export function deleteInk(id: string): Promise<void> {
+  return getDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = openWrite(db, "imageInk");
+        tx.objectStore("imageInk").delete(id);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error ?? new Error("ink delete failed"));
+        tx.onabort = () => reject(tx.error ?? new Error("ink delete aborted"));
+      }),
+  );
+}
+
+export function listInkIds(): Promise<string[]> {
+  return getDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction("imageInk", "readonly");
+        const req = tx.objectStore("imageInk").openCursor();
+        const ids: string[] = [];
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) return;
+          const row = cursor.value as InkRow;
+          if (row && typeof row.id === "string" && !isCanvasInkId(row.id) && row.png instanceof Blob && row.png.size > 0) ids.push(row.id);
+          cursor.continue();
+        };
+        tx.oncomplete = () => resolve(ids);
+        tx.onerror = () => reject(tx.error ?? new Error("ink list failed"));
+        tx.onabort = () => reject(tx.error ?? new Error("ink list aborted"));
+      }),
+  );
+}
+
+export function listPrefixedInkIds(prefix: string): Promise<string[]> {
+  return getDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction("imageInk", "readonly");
+        const req = tx.objectStore("imageInk").openCursor();
+        const ids: string[] = [];
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) return;
+          const row = cursor.value as InkRow;
+          if (row && typeof row.id === "string" && row.id.startsWith(prefix) && row.png instanceof Blob && row.png.size > 0) ids.push(row.id);
+          cursor.continue();
+        };
+        tx.oncomplete = () => resolve(ids);
+        tx.onerror = () => reject(tx.error ?? new Error("ink list failed"));
+        tx.onabort = () => reject(tx.error ?? new Error("ink list aborted"));
       }),
   );
 }
@@ -867,7 +960,33 @@ export async function readLibraryDump(onProgress?: (done: number, total: number)
     tx.onerror = () => reject(tx.error ?? new Error("blob read failed"));
     tx.onabort = () => reject(tx.error ?? new Error("blob read aborted"));
   });
-  return { metas, blobs, folders, views, tags, tagFolders, settings };
+  const inks = new Map<string, Blob>();
+  const flats = new Map<string, Blob>();
+  const placementSetting = settings.find((setting) => setting.key === CANVAS_PLACEMENTS_KEY)?.value;
+  const flatWanted = new Set(
+    parsePlacements(typeof placementSetting === "string" ? placementSetting : "").flatMap((placement) => (placement.flat ? [placement.id] : [])),
+  );
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction("imageInk", "readonly");
+    const req = tx.objectStore("imageInk").openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      const row = cursor.value as InkRow;
+      if (row && row.png instanceof Blob && row.png.size > 0 && typeof row.id === "string") {
+        if (wanted.has(row.id)) inks.set(row.id, row.png);
+        else if (row.id.startsWith(CANVAS_FLAT_PREFIX)) {
+          const placementId = row.id.slice(CANVAS_FLAT_PREFIX.length);
+          if (flatWanted.has(placementId)) flats.set(placementId, row.png);
+        }
+      }
+      cursor.continue();
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error ?? new Error("ink read failed"));
+    tx.onabort = () => reject(tx.error ?? new Error("ink read aborted"));
+  });
+  return { metas, blobs, folders, views, tags, tagFolders, settings, inks, canvas: await readInk(CANVAS_BOARD_ID), flats };
 }
 
 export type RestoreProgress = {
@@ -1120,7 +1239,7 @@ function releaseRetiredTab(tab: LibraryTab): void {
 export async function restoreLibrary(backup: ParsedBackup, onProgress?: (progress: RestoreProgress) => void, tab?: LibraryTab): Promise<void> {
   const started = performance.now();
   const total = backup.images.length;
-  const bytesTotal = backup.images.reduce((sum, image) => sum + image.original.size + (image.thumb?.size ?? 0), 0);
+  const bytesTotal = backup.images.reduce((sum, image) => sum + image.original.size + (image.thumb?.size ?? 0) + (image.ink?.size ?? 0), 0);
   const fileBytes = backup.summary.bytes;
   let saved = 0;
   let stage = "下書きの準備";
@@ -1150,32 +1269,35 @@ export async function restoreLibrary(backup: ParsedBackup, onProgress?: (progres
     }
     await txDone(metaTx);
     stage = "画像の保存";
-    const sizes = backup.images.map((image) => image.original.size + (image.thumb?.size ?? 0));
+    const sizes = backup.images.map((image) => image.original.size + (image.thumb?.size ?? 0) + (image.ink?.size ?? 0));
     let bytesDone = 0;
     for (const indexes of batchImageIndexes(sizes)) {
       report("save", saved, bytesDone);
       await yieldUi();
-      const rows: { meta: ImageMeta; original: Blob; thumb: Blob | null }[] = [];
+      const rows: { meta: ImageMeta; original: Blob; thumb: Blob | null; ink: Blob | null }[] = [];
       for (const index of indexes) {
         const image = backup.images[index];
         if (!image) continue;
         let original: Blob;
         let thumb: Blob | null = null;
+        let ink: Blob | null = null;
         try {
           original = await ownBlob(image.original, image.original.type || image.meta.mime);
           if (image.thumb) thumb = await ownBlob(image.thumb, image.thumb.type || "image/jpeg");
+          if (image.ink) ink = await ownBlob(image.ink, image.ink.type || "image/png");
         } catch (error) {
           throw fail(error, `「${image.meta.name}」のデータを読み出せませんでした。`);
         }
-        if (original.size !== image.original.size || (image.thumb && thumb?.size !== image.thumb.size)) {
+        if (original.size !== image.original.size || (image.thumb && thumb?.size !== image.thumb.size) || (image.ink && ink?.size !== image.ink.size)) {
           throw fail(new Error("size mismatch"), `「${image.meta.name}」の長さが記録と一致しません。`);
         }
-        rows.push({ meta: image.meta, original, thumb });
+        rows.push({ meta: image.meta, original, thumb, ink });
       }
-      const tx = staging.transaction(["imageMeta", "imageBlobs"], "readwrite");
+      const tx = staging.transaction(["imageMeta", "imageBlobs", "imageInk"], "readwrite");
       for (const row of rows) {
         tx.objectStore("imageMeta").put(row.meta);
         tx.objectStore("imageBlobs").put({ id: row.meta.id, original: row.original, thumb: row.thumb } satisfies BlobRow);
+        if (row.ink) tx.objectStore("imageInk").put({ id: row.meta.id, png: row.ink } satisfies InkRow);
       }
       try {
         await txDone(tx);
@@ -1184,10 +1306,28 @@ export async function restoreLibrary(backup: ParsedBackup, onProgress?: (progres
         throw fail(error, name ? `「${name}」付近の保存に失敗しました。` : "");
       }
       saved += rows.length;
-      bytesDone += rows.reduce((sum, row) => sum + row.original.size + (row.thumb?.size ?? 0), 0);
+      bytesDone += rows.reduce((sum, row) => sum + row.original.size + (row.thumb?.size ?? 0) + (row.ink?.size ?? 0), 0);
       rows.length = 0;
       report("save", saved, bytesDone);
       await yieldUi();
+    }
+    if (backup.canvas) {
+      const png = await ownBlob(backup.canvas, "image/png");
+      if (png.size !== backup.canvas.size) throw fail(new Error("size mismatch"), "キャンバスの長さが記録と一致しません。");
+      const canvasTx = staging.transaction("imageInk", "readwrite");
+      canvasTx.objectStore("imageInk").put({ id: CANVAS_BOARD_ID, png } satisfies InkRow);
+      await txDone(canvasTx);
+    }
+    if (backup.flats && backup.flats.length > 0) {
+      const rows: InkRow[] = [];
+      for (const flat of backup.flats) {
+        const png = await ownBlob(flat.png, "image/png");
+        if (png.size !== flat.png.size) throw fail(new Error("size mismatch"), "キャンバス配置画像の長さが記録と一致しません。");
+        rows.push({ id: canvasFlatId(flat.id), png });
+      }
+      const flatTx = staging.transaction("imageInk", "readwrite");
+      for (const row of rows) flatTx.objectStore("imageInk").put(row);
+      await txDone(flatTx);
     }
     stage = "件数の照合";
     report("check", saved, bytesDone);
@@ -1245,9 +1385,9 @@ export async function restoreLibrary(backup: ParsedBackup, onProgress?: (progres
   }
 }
 
-const LIBRARY_STORES = ["imageMeta", "imageBlobs", "folders", "folderViews", "tags", "tagFolders", "kv"] as const;
+const LIBRARY_STORES = ["imageMeta", "imageBlobs", "imageInk", "folders", "folderViews", "tags", "tagFolders", "kv"] as const;
 
-/** Rewrites the seven stores of the given database. It does not open or choose a database. */
+/** Rewrites the library stores of the given database. It does not open or choose a database. */
 export function replaceLibraryStores(db: IDBDatabase, backup: ParsedBackup): Promise<void> {
   return new Promise((resolve, reject) => {
     const tx = openWrite(db, [...LIBRARY_STORES]);
@@ -1256,6 +1396,11 @@ export function replaceLibraryStores(db: IDBDatabase, backup: ParsedBackup): Pro
       tx.objectStore("imageMeta").put(image.meta);
       const row: BlobRow = { id: image.meta.id, original: image.original, thumb: image.thumb };
       tx.objectStore("imageBlobs").put(row);
+      if (image.ink) tx.objectStore("imageInk").put({ id: image.meta.id, png: image.ink } satisfies InkRow);
+    }
+    if (backup.canvas) tx.objectStore("imageInk").put({ id: CANVAS_BOARD_ID, png: backup.canvas } satisfies InkRow);
+    for (const flat of backup.flats ?? []) {
+      if (flat.png instanceof Blob && flat.png.size > 0) tx.objectStore("imageInk").put({ id: canvasFlatId(flat.id), png: flat.png } satisfies InkRow);
     }
     for (const folder of backup.manifest.folders) tx.objectStore("folders").put(folder);
     for (const view of backup.manifest.folderViews) tx.objectStore("folderViews").put(view);

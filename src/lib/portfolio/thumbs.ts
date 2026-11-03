@@ -31,7 +31,7 @@ export function pinThumb(id: string): () => void {
 }
 
 export function forgetThumb(id: string): void {
-  for (const key of [id, `${id}:motion`]) {
+  for (const key of [id, `${id}:motion`, `${id}:still`]) {
     const url = urls.get(key);
     if (url) revoke(url);
     urls.delete(key);

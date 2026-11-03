@@ -324,10 +324,10 @@ export const BackupActions = forwardRef<BackupController, { disabled: boolean; v
   return (
     <>
       <Button variant="quiet" className="aux-btn" disabled={disabled || busy || sharing} onClick={() => void download()}>
-        バックアップを保存
+        {viewer ? "保存" : "バックアップを保存"}
       </Button>
       <Button variant="quiet" className="aux-btn" disabled={disabled || busy} onClick={() => inputRef.current?.click()}>
-        バックアップから復元
+        {viewer ? "復元" : "バックアップから復元"}
       </Button>
       <input
         ref={inputRef}

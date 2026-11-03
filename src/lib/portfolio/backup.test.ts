@@ -81,7 +81,7 @@ describe("backup file", () => {
       ["a", { original: new Blob(["one"], { type: "image/png" }), thumb: new Blob(["thumb"], { type: "image/jpeg" }) }],
       ["b", { original: new Blob([large], { type: "video/mp4" }), thumb: null }],
     ]);
-    const { file } = buildBackup(dump(blobs, [meta("b", { mime: "video/mp4", favorite: false }), meta("a", { memo: "夕景" })]), new Date("2026-10-26T12:00:00Z"));
+    const { file } = buildBackup(dump(blobs, [meta("b", { mime: "video/mp4", favorite: false }), meta("a", { memo: "夕景", inkVisible: false })]), new Date("2026-10-26T12:00:00Z"));
     const parsed = await readBackup(file);
     assert.deepEqual(parsed.images.map((image) => image.meta.id), ["b", "a"]);
     assert.equal(await parsed.images[1]!.original.text(), "one");
@@ -92,6 +92,10 @@ describe("backup file", () => {
     assert.equal(parsed.summary.favorites, 1);
     assert.equal(parsed.images[1]?.meta.memo, "夕景");
     assert.equal(parsed.images[0]?.meta.memo, "");
+    assert.equal(parsed.images[1]?.meta.inkVisible, false);
+    assert.equal(parsed.images[0]?.meta.inkVisible, true);
+    assert.equal(parsed.images[0]?.ink, null);
+    assert.equal(parsed.images[1]?.ink, null);
     assert.equal(parsed.manifest.tags[0]?.folderId, "group");
     assert.equal(parsed.manifest.folderViews[0]?.direction, "desc");
   });
@@ -133,6 +137,104 @@ describe("backup file", () => {
       ],
     };
     await assert.rejects(readBackup(packBackup(broken, [new Blob(["data"])])), /長さが記録と一致しません/);
+  });
+
+  it("keeps a drawing with its image and still reads a backup that has none", async () => {
+    const ink = new Blob(["ink"], { type: "image/png" });
+    const { file } = buildBackup({
+      ...dump(new Map([["a", { original: new Blob(["one"], { type: "image/png" }), thumb: null }]]), [meta("a")]),
+      inks: new Map([["a", ink]]),
+    });
+    const parsed = await readBackup(file);
+    assert.equal(await parsed.images[0]?.ink?.text(), "ink");
+    assert.equal(parsed.manifest.images[0]?.inkBytes, 3);
+    const old = parsed.manifest;
+    const withoutInk = {
+      ...old,
+      images: old.images.map((image) => {
+        const { inkBytes: _inkBytes, inkType: _inkType, ...rest } = image;
+        const { inkVisible: _inkVisible, ...meta } = rest.meta;
+        return { ...rest, meta };
+      }),
+    };
+    const legacy = packBackup(withoutInk, [parsed.images[0]!.original]);
+    const again = await readBackup(legacy);
+    assert.equal(again.images[0]?.ink, null);
+    assert.equal(again.images[0]?.meta.inkVisible, true);
+    assert.equal(await again.images[0]?.original.text(), "one");
+  });
+
+  it("keeps the canvas separate from image ink and still reads a backup without one", async () => {
+    const ink = new Blob(["ink"], { type: "image/png" });
+    const canvas = new Blob(["board"], { type: "image/png" });
+    const { file } = buildBackup({
+      ...dump(new Map([["a", { original: new Blob(["one"], { type: "image/png" }), thumb: null }]]), [meta("a")]),
+      inks: new Map([["a", ink]]),
+      canvas,
+    });
+    const parsed = await readBackup(file);
+    assert.equal(await parsed.images[0]?.ink?.text(), "ink");
+    assert.equal(await parsed.canvas?.text(), "board");
+    assert.equal(parsed.manifest.canvas?.bytes, 5);
+    const plainFile = buildBackup(dump(new Map([["a", { original: new Blob(["one"], { type: "image/png" }), thumb: null }]]), [meta("a")]));
+    const plain = await readBackup(plainFile.file);
+    assert.equal(plain.canvas, null);
+    assert.equal(plain.manifest.canvas, undefined);
+  });
+
+  it("keeps canvas placements in settings, away from the pen layer and the sheet", async () => {
+    const placements = JSON.stringify([{ id: "p", imageId: "a", x: 1, y: 2, width: 30, rotation: 4, z: 1 }]);
+    const { file } = buildBackup({
+      ...dump(new Map([["a", { original: new Blob(["one"], { type: "image/png" }), thumb: null }]]), [meta("a")]),
+      inks: new Map([["a", new Blob(["ink"], { type: "image/png" })]]),
+      canvas: new Blob(["board"], { type: "image/png" }),
+      settings: [
+        { key: "favoritesOnly", value: 1 },
+        { key: "canvasPlacements", value: placements },
+      ],
+    });
+    const parsed = await readBackup(file);
+    assert.equal(parsed.manifest.settings.find((setting) => setting.key === "canvasPlacements")?.value, placements);
+    assert.equal(await parsed.images[0]?.ink?.text(), "ink");
+    assert.equal(await parsed.canvas?.text(), "board");
+    const older = buildBackup(dump(new Map([["a", { original: new Blob(["one"], { type: "image/png" }), thumb: null }]]), [meta("a")]));
+    const plain = await readBackup(older.file);
+    assert.equal(plain.manifest.settings.some((setting) => setting.key === "canvasPlacements"), false);
+  });
+
+  it("keeps a drop-time memo composite after the sheet and still reads a backup without one", async () => {
+    const placements = JSON.stringify([{ id: "p", imageId: "a", x: 1, y: 2, width: 30, rotation: 0, z: 1, flat: true }]);
+    const { file } = buildBackup({
+      ...dump(new Map([["a", { original: new Blob(["one"], { type: "image/png" }), thumb: null }]]), [meta("a")]),
+      inks: new Map([["a", new Blob(["ink"], { type: "image/png" })]]),
+      canvas: new Blob(["board"], { type: "image/png" }),
+      flats: new Map([
+        ["p", new Blob(["flat"], { type: "image/png" })],
+        ["q", new Blob(["second"], { type: "image/png" })],
+      ]),
+      settings: [{ key: "canvasPlacements", value: placements }],
+    });
+    const parsed = await readBackup(file);
+    assert.equal(await parsed.images[0]?.ink?.text(), "ink");
+    assert.equal(await parsed.canvas?.text(), "board");
+    assert.deepEqual(
+      parsed.flats?.map((flat) => flat.id),
+      ["p", "q"],
+    );
+    assert.equal(await parsed.flats?.[0]?.png.text(), "flat");
+    assert.equal(await parsed.flats?.[1]?.png.text(), "second");
+    assert.equal(parsed.manifest.flats?.[0]?.bytes, 4);
+    const bare = buildBackup({
+      ...dump(new Map([["a", { original: new Blob(["one"], { type: "image/png" }), thumb: null }]]), [meta("a")]),
+      flats: new Map([["p", new Blob(["only"], { type: "image/png" })]]),
+    });
+    const withoutSheet = await readBackup(bare.file);
+    assert.equal(withoutSheet.canvas, null);
+    assert.equal(await withoutSheet.flats?.[0]?.png.text(), "only");
+    const older = buildBackup(dump(new Map([["a", { original: new Blob(["one"], { type: "image/png" }), thumb: null }]]), [meta("a")]));
+    const plain = await readBackup(older.file);
+    assert.equal(plain.flats?.length, 0);
+    assert.equal(plain.manifest.flats, undefined);
   });
 
   it("refuses to pack a library whose image body is missing", () => {

@@ -19,6 +19,9 @@ export type BackupImageRecord = {
   originalType: string;
   thumbBytes: number;
   thumbType: string | null;
+  /** Omitted by backups saved before ink layers existed. */
+  inkBytes?: number;
+  inkType?: string | null;
 };
 
 export type BackupSetting = { key: string; value: string | number };
@@ -35,6 +38,10 @@ export type BackupManifest = {
   tags: Tag[];
   tagFolders: TagFolder[];
   settings: BackupSetting[];
+  /** Omitted when the A4 canvas is blank. Separate from image ink. */
+  canvas?: { bytes: number; type: string } | null;
+  /** Drop-time picture+memo composites, after the sheet bytes. Omitted by older backups. */
+  flats?: { id: string; bytes: number; type: string }[];
 };
 
 export type BackupSummary = {
@@ -50,7 +57,11 @@ export type BackupSummary = {
 
 export type ParsedBackup = {
   manifest: BackupManifest;
-  images: { meta: ImageMeta; original: Blob; thumb: Blob | null }[];
+  images: { meta: ImageMeta; original: Blob; thumb: Blob | null; ink: Blob | null }[];
+  /** A4 canvas drawing. Null when the backup has none. */
+  canvas?: Blob | null;
+  /** Picture+memo composites keyed by placement id. Empty when the backup has none. */
+  flats?: { id: string; png: Blob }[];
   summary: BackupSummary;
 };
 
@@ -74,6 +85,7 @@ export function emptyLibraryBackup(folder: Folder): ParsedBackup {
       createdAt,
     },
     images: [],
+    canvas: null,
     manifest: {
       format: "komacho-backup",
       version: BACKUP_VERSION,
@@ -99,6 +111,12 @@ export type LibraryDump = {
   tags: Tag[];
   tagFolders: TagFolder[];
   settings: BackupSetting[];
+  /** Drawings keyed by image id. Omitted when nothing was drawn. */
+  inks?: ReadonlyMap<string, Blob>;
+  /** A4 canvas. Not an image memo. */
+  canvas?: Blob | null;
+  /** Picture+memo composites keyed by placement id. Not image ink and not the sheet. */
+  flats?: ReadonlyMap<string, Blob>;
 };
 
 export type BackupReadProgress = {
@@ -161,12 +179,19 @@ export function validateManifest(raw: unknown): BackupManifest {
     if (thumbBytes < 0) throw new BackupError(`「${meta.name}」のサムネイル情報が不正です。`);
     if (typeof image.originalType !== "string") throw new BackupError(`「${meta.name}」の形式が不正です。`);
     if (image.thumbType !== null && typeof image.thumbType !== "string") throw new BackupError(`「${meta.name}」のサムネイル形式が不正です。`);
+    const inkBytes = image.inkBytes === undefined ? 0 : byteLength(image.inkBytes);
+    if (inkBytes < 0) throw new BackupError(`「${meta.name}」の書き込み情報が不正です。`);
+    if (inkBytes > 0 && image.inkType != null && typeof image.inkType !== "string") {
+      throw new BackupError(`「${meta.name}」の書き込み形式が不正です。`);
+    }
     return {
       meta,
       originalBytes,
       originalType: image.originalType || meta.mime,
       thumbBytes,
       thumbType: thumbBytes > 0 ? image.thumbType || "image/jpeg" : null,
+      inkBytes,
+      inkType: inkBytes > 0 ? image.inkType || "image/png" : null,
     };
   });
   uniqueIds(images.map((image) => image.meta.id), "画像");
@@ -207,7 +232,49 @@ export function validateManifest(raw: unknown): BackupManifest {
   });
   uniqueIds(settings.map((setting) => setting.key), "設定");
 
-  return { format: "komacho-backup", version: BACKUP_VERSION, createdAt: row.createdAt, images, folders, folderViews, tags, tagFolders, settings };
+  let canvas: BackupManifest["canvas"];
+  const rawCanvas = (row as { canvas?: unknown }).canvas;
+  if (rawCanvas != null) {
+    if (typeof rawCanvas !== "object") throw new BackupError("キャンバスの情報が不正です。");
+    const bytes = byteLength((rawCanvas as { bytes?: unknown }).bytes);
+    if (bytes < 0) throw new BackupError("キャンバスの情報が不正です。");
+    const type = (rawCanvas as { type?: unknown }).type;
+    if (bytes > 0 && type != null && typeof type !== "string") throw new BackupError("キャンバスの形式が不正です。");
+    if (bytes > 0) canvas = { bytes, type: typeof type === "string" && type ? type : "image/png" };
+  }
+
+  let flats: BackupManifest["flats"];
+  const rawFlats = (row as { flats?: unknown }).flats;
+  if (rawFlats != null) {
+    if (!Array.isArray(rawFlats)) throw new BackupError("キャンバス配置画像の情報が不正です。");
+    const seen = new Set<string>();
+    const next: { id: string; bytes: number; type: string }[] = [];
+    for (const entry of rawFlats) {
+      if (!entry || typeof entry !== "object") throw new BackupError("キャンバス配置画像の情報が不正です。");
+      const flat = entry as { id?: unknown; bytes?: unknown; type?: unknown };
+      if (typeof flat.id !== "string" || !flat.id || seen.has(flat.id)) throw new BackupError("キャンバス配置画像の情報が不正です。");
+      const bytes = byteLength(flat.bytes);
+      if (bytes < 1) throw new BackupError("キャンバス配置画像の情報が不正です。");
+      if (flat.type != null && typeof flat.type !== "string") throw new BackupError("キャンバス配置画像の形式が不正です。");
+      seen.add(flat.id);
+      next.push({ id: flat.id, bytes, type: typeof flat.type === "string" && flat.type ? flat.type : "image/png" });
+    }
+    if (next.length > 0) flats = next;
+  }
+
+  return {
+    format: "komacho-backup",
+    version: BACKUP_VERSION,
+    createdAt: row.createdAt,
+    images,
+    folders,
+    folderViews,
+    tags,
+    tagFolders,
+    settings,
+    ...(canvas ? { canvas } : {}),
+    ...(flats ? { flats } : {}),
+  };
 }
 
 export function packBackup(manifest: BackupManifest, binaries: Blob[]): Blob {
@@ -242,16 +309,27 @@ export function buildBackup(dump: LibraryDump, createdAt = new Date()): { file: 
   for (const meta of dump.metas) {
     const row = dump.blobs.get(meta.id)!;
     const thumb = row.thumb instanceof Blob && row.thumb.size > 0 ? row.thumb : null;
+    const ink = dump.inks?.get(meta.id);
+    const inkBlob = ink instanceof Blob && ink.size > 0 ? ink : null;
     images.push({
       meta,
       originalBytes: row.original.size,
       originalType: row.original.type || meta.mime,
       thumbBytes: thumb?.size ?? 0,
       thumbType: thumb ? thumb.type || "image/jpeg" : null,
+      inkBytes: inkBlob?.size ?? 0,
+      inkType: inkBlob ? "image/png" : null,
     });
     binaries.push(row.original);
     if (thumb) binaries.push(thumb);
+    if (inkBlob) binaries.push(inkBlob);
   }
+  const canvas = dump.canvas instanceof Blob && dump.canvas.size > 0 ? dump.canvas : null;
+  if (canvas) binaries.push(canvas);
+  const flatRows = [...(dump.flats?.entries() ?? [])]
+    .filter((entry): entry is [string, Blob] => entry[0].length > 0 && entry[1] instanceof Blob && entry[1].size > 0)
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  for (const [, blob] of flatRows) binaries.push(blob);
   const manifest: BackupManifest = {
     format: "komacho-backup",
     version: BACKUP_VERSION,
@@ -262,6 +340,8 @@ export function buildBackup(dump: LibraryDump, createdAt = new Date()): { file: 
     tags: dump.tags,
     tagFolders: dump.tagFolders,
     settings: dump.settings,
+    ...(canvas ? { canvas: { bytes: canvas.size, type: "image/png" } } : {}),
+    ...(flatRows.length > 0 ? { flats: flatRows.map(([id, blob]) => ({ id, bytes: blob.size, type: "image/png" })) } : {}),
   };
   const file = packBackup(manifest, binaries);
   return { file, summary: summarize(manifest, file.size) };
@@ -323,19 +403,36 @@ export async function readBackup(file: Blob, onProgress?: (progress: BackupReadP
     const image = manifest.images[index]!;
     const originalEnd = offset + image.originalBytes;
     const thumbEnd = originalEnd + image.thumbBytes;
-    if (thumbEnd > file.size) throw new BackupError("画像データが途中で切れています。");
+    const inkEnd = thumbEnd + (image.inkBytes ?? 0);
+    if (inkEnd > file.size) throw new BackupError("画像データが途中で切れています。");
     images.push({
       meta: image.meta,
       original: file.slice(offset, originalEnd, image.originalType || image.meta.mime),
       thumb: image.thumbBytes > 0 ? file.slice(originalEnd, thumbEnd, image.thumbType || "image/jpeg") : null,
+      ink: (image.inkBytes ?? 0) > 0 ? file.slice(thumbEnd, inkEnd, image.inkType || "image/png") : null,
     });
-    offset = thumbEnd;
+    offset = inkEnd;
     if (onProgress && index > 0 && index % 100 === 0) {
       onProgress({ stage: "verify", done: index, total: manifest.images.length });
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
   }
+  const canvasBytes = manifest.canvas?.bytes ?? 0;
+  let canvas: Blob | null = null;
+  if (canvasBytes > 0) {
+    const canvasEnd = offset + canvasBytes;
+    if (canvasEnd > file.size) throw new BackupError("キャンバスのデータが途中で切れています。");
+    canvas = file.slice(offset, canvasEnd, manifest.canvas?.type || "image/png");
+    offset = canvasEnd;
+  }
+  const flats: { id: string; png: Blob }[] = [];
+  for (const record of manifest.flats ?? []) {
+    const end = offset + record.bytes;
+    if (end > file.size) throw new BackupError("キャンバス配置画像のデータが途中で切れています。");
+    flats.push({ id: record.id, png: file.slice(offset, end, record.type || "image/png") });
+    offset = end;
+  }
   if (offset !== file.size) throw new BackupError("ファイルの長さが記録と一致しません。");
   onProgress?.({ stage: "verify", done: manifest.images.length, total: manifest.images.length });
-  return { manifest, images, summary: summarize(manifest, file.size) };
+  return { manifest, images, canvas, flats, summary: summarize(manifest, file.size) };
 }
