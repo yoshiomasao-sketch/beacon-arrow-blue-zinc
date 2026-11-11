@@ -18,6 +18,7 @@ import {
   settleParentFolders,
   storedImageCount,
   flattenFolders,
+  descendantFolderIds,
   copiedFolderHiddenIds,
   normalizeFolders,
   importNotice,
@@ -353,6 +354,40 @@ describe("normalizeMeta", () => {
       })?.inkVisible,
       false,
     );
+    assert.deepEqual(
+      normalizeMeta({
+        id: "a",
+        mime: "image/png",
+        puru: { markers: [{ id: 1, kind: "mid", u: 0.4, v: 0.6, radius: 0.25, view: 0.8 }] },
+        vectors: { markers: [{ id: 2, kind: "orbit", pace: "slow", u: 0.2, v: 0.3, radius: 0.2, angle: 1 }] },
+      })?.vectors?.markers[0]?.kind,
+      "orbit",
+    );
+    assert.equal(
+      normalizeMeta({
+        id: "a",
+        mime: "image/png",
+        puru: { markers: [{ id: 1, kind: "mid", u: 0.4, v: 0.6, radius: 0.25, view: 0.8 }] },
+        vectors: { markers: [{ id: 2, kind: "orbit", pace: "slow", u: 0.2, v: 0.3, radius: 0.2, angle: 1 }] },
+      })?.puru?.markers[0]?.kind,
+      "mid",
+    );
+    assert.equal(
+      normalizeMeta({
+        id: "a",
+        mime: "image/png",
+        play: { kind: "swayX", speed: "fast", reverse: true, zoom: true, twist: false, tilt: "right", voiceId: "声1.wav", rate: 1.5, volume: 40 },
+      })?.play?.voiceId,
+      "声1.wav",
+    );
+    assert.equal(
+      normalizeMeta({
+        id: "b",
+        mime: "image/png",
+        play: { kind: "orbit", speed: "slow", voiceId: "声2.wav", rate: 1, volume: 80 },
+      })?.play?.kind,
+      "orbit",
+    );
     assert.equal(commitMemo("", ""), "cancel");
     assert.equal(commitMemo("", "   "), "cancel");
     assert.equal(commitMemo("夕景", ""), "clear");
@@ -616,6 +651,12 @@ describe("folder hierarchy", () => {
     assert.equal(tree[1]?.depth, 1);
     assert.equal(folderWouldCycle([manga, workA], "manga", "a"), true);
     assert.equal(folderWouldCycle([manga, workA, anime], "a", "anime"), false);
+    const cyclic = [
+      { ...manga, parentId: "a" },
+      workA,
+    ];
+    assert.deepEqual(descendantFolderIds(cyclic, "manga"), ["a"]);
+    assert.deepEqual(flattenFolders(cyclic), []);
   });
 
   it("keeps a copied folder hidden only when the source folder was hidden", () => {

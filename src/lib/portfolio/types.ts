@@ -35,6 +35,12 @@ export type ImageMeta = {
   memo: string;
   /** False hides the pen layer only. Missing means shown. */
   inkVisible?: boolean;
+  /** Puru markers kept with this image id. Missing means none were saved. */
+  puru?: ImagePuru;
+  /** Vector markers kept with this image id. Missing means none were saved. */
+  vectors?: ImageVectors;
+  /** Animation and voice preset for this image. Missing means none was saved. */
+  play?: ImagePlay;
 };
 
 export type Tag = {
@@ -56,6 +62,50 @@ export type TagFolder = {
 };
 
 export const TAG_COLORS = ["#e07a5f", "#d4b483", "#81b29a", "#7eb6d6", "#c38d9e", "#b8a1e3", "#e6c35c", "#8fbf9f"] as const;
+
+/** Marker layout for one image. Absent on older records, which start with no markers. */
+export type ImagePuru = {
+  markers: {
+    id: number;
+    kind: string;
+    u: number;
+    v: number;
+    radius: number;
+    view?: number;
+  }[];
+};
+
+/** Vector-marker layout for one image. Separate from puru markers. Absent means none were saved. */
+export type ImageVectors = {
+  markers: {
+    id: number;
+    kind: string;
+    pace?: string;
+    u: number;
+    v: number;
+    radius: number;
+    view?: number;
+    angle?: number;
+  }[];
+};
+
+/** Saved animation and voice for one image. Voice is a catalog id, not a playback URL. */
+export type ImagePlay = {
+  kind: "swayX" | "hitX" | "swayY" | "hitY" | "orbit" | "zoom" | "buzz" | null;
+  speed: "slow" | "normal" | "fast" | "rapid" | "ultra";
+  reverse: boolean;
+  zoom: boolean;
+  twist: boolean;
+  /** Missing on older favorites.「普通」keeps the clock those favorites were saved with. */
+  zoomPace: "slow" | "normal" | "fast";
+  twistPace: "slow" | "normal" | "fast";
+  tilt: "right" | "left" | null;
+  /** True when this favorite also plays the image's vector markers. Missing means off. */
+  vector: boolean;
+  voiceId: string | null;
+  rate: 0.5 | 1 | 1.5 | 2;
+  volume: number;
+};
 
 export const TAG_DRAG = "application/x-komacho-tag";
 

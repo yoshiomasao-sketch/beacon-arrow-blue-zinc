@@ -1,6 +1,7 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { APP_UPDATED_LABEL, APP_VERSION } from "@/lib/portfolio/app-version";
 import { measureStorage } from "@/lib/portfolio/db";
 import {
   formatBytes,
@@ -51,9 +52,9 @@ export function StorageDialog({ open, onOpenChange }: { open: boolean; onOpenCha
         <Dialog.Content className="storage-sheet">
           <div className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
             <div>
-              <Dialog.Title className="font-medium">容量</Dialog.Title>
+              <Dialog.Title className="font-medium">詳細</Dialog.Title>
               <Dialog.Description className="text-sm text-ink-muted">
-                ブラウザが示している保存容量の目安です。実際に保存できる量を保証するものではありません。
+                アプリのバージョンと、ブラウザが示している保存容量の目安です。実際に保存できる量を保証するものではありません。
               </Dialog.Description>
             </div>
             <Dialog.Close asChild>
@@ -61,6 +62,11 @@ export function StorageDialog({ open, onOpenChange }: { open: boolean; onOpenCha
             </Dialog.Close>
           </div>
           <div className="space-y-4 px-4 py-4 text-sm">
+            <section className="space-y-1">
+              <h2 className="font-medium">バージョン</h2>
+              <p className="tabular-nums">{APP_VERSION}</p>
+              <p>{APP_UPDATED_LABEL}</p>
+            </section>
             {measuring ? <p className="text-ink-muted">容量を計測しています。</p> : null}
             <section className="space-y-2">
               <h2 className="font-medium">このアプリの使用量</h2>

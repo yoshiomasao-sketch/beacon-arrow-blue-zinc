@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { fileFromOriginal, OWN_FILE_DRAG, SHOT_DRAG, writeOriginalDrag, type OriginalDragSink } from "./export-file.ts";
+import { fileFromOriginal, offerOriginal, OWN_FILE_DRAG, SHOT_DRAG, writeOriginalDrag, type OriginalDragSink } from "./export-file.ts";
 
 describe("original drag payload", () => {
   it("passes the original bytes and mime through unchanged", async () => {
@@ -29,12 +29,13 @@ describe("original drag payload", () => {
         },
       },
     };
-    writeOriginalDrag(sink, "shot-1", file);
+    writeOriginalDrag(sink, "shot-1", file, "blob:http://local/original");
     assert.equal(sink.effectAllowed, "copy");
-    assert.equal(sink.cleared, true);
+    assert.equal(sink.cleared, false);
     assert.equal(sink.data.get(SHOT_DRAG), "shot-1");
     assert.equal(sink.data.get(OWN_FILE_DRAG), "shot-1");
     assert.equal(sink.data.get("text/plain"), "夕景.png");
+    assert.equal(sink.data.get("DownloadURL"), "image/png:夕景.png:blob:http://local/original");
     assert.equal(sink.added, file);
   });
 
@@ -43,5 +44,21 @@ describe("original drag payload", () => {
     assert.equal(file.name, "scan.jpg");
     assert.equal(file.type, "image/jpeg");
     assert.equal(file.size, 3);
+  });
+
+  it("reuses a file already built from the same stored image", async () => {
+    const bytes = new Uint8Array([9, 8, 7, 6]);
+    const first = offerOriginal(
+      { id: "same-shot", name: "花", mime: "image/png", addedAt: 20 },
+      new Blob([bytes], { type: "image/png" }),
+    );
+    const second = offerOriginal(
+      { id: "same-shot", name: "花", mime: "image/png", addedAt: 20 },
+      new Blob([bytes], { type: "image/png" }),
+    );
+    assert.equal(second, first);
+    assert.equal(first.name, "花.png");
+    assert.equal(first.type, "image/png");
+    assert.deepEqual(new Uint8Array(await first.arrayBuffer()), bytes);
   });
 });

@@ -1,7 +1,7 @@
 import { Download } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { readPixels } from "@/lib/portfolio/db";
-import { cachedOriginal, downloadOriginal, OWN_FILE_DRAG, primeOriginal } from "@/lib/portfolio/export-file";
+import { beginOwnFileDrag, cachedOriginal, downloadOriginal, endOwnFileDrag, OWN_FILE_DRAG, primeOriginal } from "@/lib/portfolio/export-file";
 import { exportFileName } from "@/lib/portfolio/logic";
 import { loadThumb, pinThumb } from "@/lib/portfolio/thumbs";
 import type { ImageMeta } from "@/lib/portfolio/types";
@@ -71,8 +71,12 @@ function FileRow({ item, onJump, viewer }: { item: ImageMeta; onJump: (id: strin
           if (image) transfer.setDragImage(image, 16, 16);
           dragged.current = true;
           setDragging(true);
+          beginOwnFileDrag();
         }}
-        onDragEnd={() => setDragging(false)}
+        onDragEnd={() => {
+          endOwnFileDrag();
+          setDragging(false);
+        }}
         onClick={() => {
           if (dragged.current) {
             dragged.current = false;

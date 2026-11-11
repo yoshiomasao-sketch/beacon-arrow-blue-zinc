@@ -2,7 +2,7 @@ import { Check, Eye, EyeOff, Heart, Pencil, Trash2 } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
 import { readInk, readPixels } from "@/lib/portfolio/db";
-import { cachedOriginal, primeOriginal, writeOriginalDrag } from "@/lib/portfolio/export-file";
+import { primeOriginal } from "@/lib/portfolio/export-file";
 import { type FlowBox } from "@/lib/portfolio/logic";
 import { SHOT_TIMEOUT_MS, shotAfterFailure, shotRetryDelay } from "@/lib/portfolio/shot-load";
 import { invalidateThumb, loadThumb, peekThumb, pinThumb } from "@/lib/portfolio/thumbs";
@@ -10,6 +10,9 @@ import { TAG_DRAG, type ImageMeta, type Tag } from "@/lib/portfolio/types";
 import { currentTagDrag, eventIsTagDrag } from "@/lib/portfolio/tag-drag";
 import { setInkVisible, usePortfolio } from "@/lib/portfolio/store";
 import { placeSpot } from "@/components/portfolio/spot-confirm";
+import { THUMB_REST, THUMB_RETURN_EASE, THUMB_RETURN_MS, thumbFollow, thumbSheen, thumbTiltEnabled, thumbTiltFromPointer, thumbUnit, type ThumbTilt } from "@/lib/portfolio/thumb-tilt";
+import { holdGallerySensor } from "@/lib/portfolio/sensor-gallery";
+import { zoomRectOf, type ZoomRect } from "@/lib/portfolio/thumb-zoom";
 
 const DRAG_SLOP = 6;
 
@@ -145,6 +148,24 @@ function placedMedia(boxW: number, boxH: number, imageW: number, imageH: number)
 }
 function isTagDrag(event: React.DragEvent): boolean {
   return eventIsTagDrag(event.dataTransfer.types);
+}
+
+function paintThumb(node: HTMLElement, tilt: ThumbTilt) {
+  const gloss = thumbSheen(tilt);
+  node.style.setProperty("--thumb-rx", `${tilt.x.toFixed(2)}deg`);
+  node.style.setProperty("--thumb-ry", `${tilt.y.toFixed(2)}deg`);
+  node.style.setProperty("--thumb-sx", `${gloss.x.toFixed(2)}%`);
+  node.style.setProperty("--thumb-sy", `${gloss.y.toFixed(2)}%`);
+  node.style.setProperty("--thumb-so", gloss.opacity.toFixed(3));
+  node.style.setProperty("--thumb-st", `${gloss.turn.toFixed(2)}deg`);
+}
+
+function thumbMotion(node: HTMLElement, returning: boolean) {
+  const sheen = node.querySelector(".shot-sheen");
+  const ease = `${THUMB_RETURN_MS}ms ${THUMB_RETURN_EASE}`;
+  node.style.transition = returning ? `transform ${ease}` : "none";
+  node.style.willChange = returning ? "auto" : "transform";
+  if (sheen instanceof HTMLElement) sheen.style.transition = returning ? `transform ${ease}, opacity ${ease}` : "none";
 }
 
 const inkPreviewCache = new Map<string, { rev: number; url: string }>();
@@ -292,11 +313,11 @@ export function ImageCard({
   box,
   tags,
   dragging,
+  settling = false,
   insertEdge,
   onOpen,
   onInk,
   onDragStart,
-  onExternalDrag,
   flash,
   fading,
   origin = "",
@@ -309,16 +330,17 @@ export function ImageCard({
   onTagPrompt,
   viewer = false,
   gifMotion = true,
+  zoomSource = false,
 }: {
   item: ImageMeta;
   box: FlowBox;
   tags: Tag[];
   dragging: boolean;
+  settling?: boolean;
   insertEdge: "before" | "after" | null;
-  onOpen: (id: string) => void;
+  onOpen: (id: string, from?: ZoomRect) => void;
   onInk: (id: string) => void;
   onDragStart: (id: string, event: PointerEvent) => void;
-  onExternalDrag: (id: string, point: { x: number; y: number }) => void;
   flash: boolean;
   fading: boolean;
   origin?: string;
@@ -332,19 +354,22 @@ export function ImageCard({
   onTagPrompt: (imageId: string, tagId: string, rect: DOMRect) => void;
   viewer?: boolean;
   gifMotion?: boolean;
+  zoomSource?: boolean;
 }) {
   const frameRef = useRef<HTMLDivElement>(null);
+  const contactRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLLIElement>(null);
+  const tiltShown = useRef<ThumbTilt>(THUMB_REST);
+  const tiltTarget = useRef<ThumbTilt>(THUMB_REST);
+  const tiltFrame = useRef(0);
+  const tiltLive = useRef(false);
   const mediaRef = useRef<HTMLImageElement | HTMLVideoElement>(null);
   const reportRef = useRef<{
     loaded: (width: number, height: number) => void;
     failed: () => void;
   } | null>(null);
   const suppressClick = useRef(false);
-  const nativeDrag = useRef(false);
   const pointerOwned = useRef(false);
-  const gestureKind = useRef("mouse");
-  const gesturePointer = useRef<number | null>(null);
   const slopCleanup = useRef<(() => void) | null>(null);
   const pauseMotion = item.animated && !gifMotion;
   const pixelKey = pauseMotion ? `${item.id}:still` : item.animated ? `${item.id}:motion` : item.id;
@@ -616,6 +641,44 @@ export function ImageCard({
     }
   }, [url]);
 
+  useEffect(() => {
+    if (!dragging) {
+      const node = rootRef.current;
+      if (node?.matches(":hover")) setHover(true);
+      return;
+    }
+    tiltLive.current = false;
+    if (tiltFrame.current) cancelAnimationFrame(tiltFrame.current);
+    tiltFrame.current = 0;
+    tiltShown.current = THUMB_REST;
+    tiltTarget.current = THUMB_REST;
+    rootRef.current?.classList.remove("is-pressing", "is-relaxing");
+    const face = contactRef.current;
+    if (!face) return;
+    thumbMotion(face, false);
+    paintThumb(face, THUMB_REST);
+  }, [dragging]);
+
+  useEffect(() => {
+    const rest = () => {
+      tiltLive.current = false;
+      if (tiltFrame.current) cancelAnimationFrame(tiltFrame.current);
+      tiltFrame.current = 0;
+      tiltShown.current = THUMB_REST;
+      tiltTarget.current = THUMB_REST;
+      setHover(false);
+      const face = contactRef.current;
+      if (!face) return;
+      thumbMotion(face, true);
+      paintThumb(face, THUMB_REST);
+    };
+    window.addEventListener("komacho-thumb-rest", rest);
+    return () => {
+      window.removeEventListener("komacho-thumb-rest", rest);
+      if (tiltFrame.current) cancelAnimationFrame(tiltFrame.current);
+    };
+  }, []);
+
   const menu = hover || pinned;
   const fit = menuFit(box.w, box.h);
   const mediaStyle = placedMedia(box.w, box.h, item.width, item.height);
@@ -627,16 +690,20 @@ export function ImageCard({
 
   const onPointerDown = (event: ReactPointerEvent<HTMLLIElement>) => {
     if (event.button !== 0) return;
-    const target = event.target as Element | null;
-    if (target?.closest(".shot-menu button, .shot-menu a, .shot-menu input, .shot-menu textarea")) return;
+    // The phone list uses this gesture for scrolling and the side menus.
+    // Reorder, the drag clone, and the return flight stay on the desktop layout.
+    if (viewer) return;
     prepareExport();
     const startX = event.clientX;
     const startY = event.clientY;
     const pointerId = event.pointerId;
     const kind = event.pointerType || "mouse";
     const stylus = stylusPointer(kind);
-    gestureKind.current = kind;
-    gesturePointer.current = pointerId;
+    const target = event.target as Element | null;
+    // Text fields keep their own gesture. Buttons stay clickable, but the same
+    // 6px slop can still pick the card up — a short card's menu must not shrink
+    // the grab area when the window gets smaller.
+    if (target?.closest(".shot-menu input, .shot-menu textarea, .shot-menu select, .shot-menu a")) return;
     pointerOwned.current = false;
     const hit = target?.closest(".shot-hit");
     // Capture the button, not the card. Capturing the card retargets the click
@@ -660,25 +727,17 @@ export function ImageCard({
       const dx = pointer.clientX - startX;
       const dy = pointer.clientY - startY;
       if (dx * dx + dy * dy < DRAG_SLOP * DRAG_SLOP) return;
-      if (viewer) {
-        suppressClick.current = true;
-        return;
-      }
-      // Mouse: once the original file is cached, the browser drag carries it
-      // out and also reorders. A stylus must not take that shortcut — if the
-      // browser drag never starts, skipping here drops the gesture entirely.
-      if (!stylus && (nativeDrag.current || cachedOriginal(item.id))) {
-        suppressClick.current = true;
-        return;
-      }
-      if (nativeDrag.current) {
-        suppressClick.current = true;
-        return;
-      }
       started = true;
       pointerOwned.current = true;
       suppressClick.current = true;
-      cleanup();
+      if (hit instanceof HTMLElement) {
+        try {
+          hit.setPointerCapture(pointerId);
+        } catch {
+          /* window listeners still follow the pointer */
+        }
+      }
+      window.removeEventListener("pointermove", move, true);
       onDragStart(item.id, pointer);
     };
     const end = (pointer: PointerEvent) => {
@@ -697,68 +756,22 @@ export function ImageCard({
     window.addEventListener("pointercancel", end, true);
   };
 
-  const releaseGestureCapture = () => {
-    const pointerId = gesturePointer.current;
-    const hit = rootRef.current?.querySelector(".shot-hit");
-    if (pointerId === null || !(hit instanceof HTMLElement) || !hit.hasPointerCapture(pointerId)) return;
-    try {
-      hit.releasePointerCapture(pointerId);
-    } catch {
-      /* the drag already released it */
-    }
-  };
-
   const onExportDragStart = (event: React.DragEvent<HTMLButtonElement>) => {
-    if (viewer) {
-      event.preventDefault();
-      return;
-    }
-    // The pointer session is already following the pen. A native drag would
-    // swallow pointerup, so the canvas drop would never land.
-    if (stylusPointer(gestureKind.current) && pointerOwned.current) {
-      event.preventDefault();
-      return;
-    }
-    const file = cachedOriginal(item.id);
-    const transfer = event.dataTransfer;
-    if (!file || !transfer) {
-      event.preventDefault();
-      return;
-    }
-    try {
-      writeOriginalDrag(transfer, item.id, file);
-    } catch {
-      event.preventDefault();
-      return;
-    }
-    const image = event.currentTarget.querySelector("img");
-    if (image instanceof HTMLImageElement) {
-      const rect = image.getBoundingClientRect();
-      transfer.setDragImage(image, Math.round(event.clientX - rect.left), Math.round(event.clientY - rect.top));
-    }
-    nativeDrag.current = true;
-    pointerOwned.current = false;
-    suppressClick.current = true;
-    slopCleanup.current?.();
-    onExternalDrag(item.id, { x: event.clientX, y: event.clientY });
-  };
-
-  const onExportDragEnd = () => {
-    nativeDrag.current = false;
-    releaseGestureCapture();
-    window.setTimeout(() => {
-      suppressClick.current = false;
-    }, 0);
+    // The picture is not a native drag source. Chrome would otherwise steal
+    // the gesture before the pointer slop, and a cached file never started
+    // that drag because the image itself is not draggable.
+    event.preventDefault();
   };
 
   const className = [
     "shot-card",
-    dragging ? "is-dragging" : "",
+    dragging ? "is-dragging" : settling ? "is-drag-return" : "",
     selected ? "is-selected" : "",
     tagHot ? "is-tag-hot" : "",
     menu ? "is-menu" : "",
     flash ? "is-flash" : "",
     flash && fading ? "is-fade" : "",
+    zoomSource ? "is-zoom-source" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -770,13 +783,55 @@ export function ImageCard({
       data-fit={fit}
       className={className}
       style={{ left: box.x, top: box.y, width: box.w, height: box.h }}
-      onPointerDown={onPointerDown}
+      onPointerDownCapture={onPointerDown}
+      onClickCapture={(event) => {
+        if (!suppressClick.current) return;
+        event.preventDefault();
+        event.stopPropagation();
+      }}
       onPointerEnter={(event) => {
+        if (event.currentTarget.closest(".is-shuffle-run")) return;
         if (event.pointerType === "mouse") setHover(true);
         prepareExport();
       }}
+      onPointerMove={(event) => {
+        if (event.currentTarget.closest(".is-shuffle-run")) return;
+        const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        if (!thumbTiltEnabled(event.pointerType, reduced) || dragging || zoomSource) return;
+        const rect = event.currentTarget.getBoundingClientRect();
+        tiltTarget.current = thumbTiltFromPointer(
+          thumbUnit(event.clientX - (rect.left + rect.width / 2), rect.width / 2),
+          thumbUnit(event.clientY - (rect.top + rect.height / 2), rect.height / 2),
+        );
+        tiltLive.current = true;
+        const face = contactRef.current;
+        if (face) thumbMotion(face, false);
+        if (tiltFrame.current) return;
+        const tick = () => {
+          tiltFrame.current = 0;
+          if (!tiltLive.current) return;
+          const next = thumbFollow(tiltShown.current, tiltTarget.current);
+          tiltShown.current = next;
+          const face = contactRef.current;
+          if (face) paintThumb(face, next);
+          const goal = tiltTarget.current;
+          if (next.x !== goal.x || next.y !== goal.y) tiltFrame.current = requestAnimationFrame(tick);
+        };
+        tiltFrame.current = requestAnimationFrame(tick);
+      }}
       onPointerLeave={(event) => {
         if (event.pointerType === "mouse") setHover(false);
+        if (event.pointerType !== "mouse") return;
+        if (dragging || pointerOwned.current) return;
+        tiltLive.current = false;
+        if (tiltFrame.current) cancelAnimationFrame(tiltFrame.current);
+        tiltFrame.current = 0;
+        tiltShown.current = THUMB_REST;
+        tiltTarget.current = THUMB_REST;
+        const face = contactRef.current;
+        if (!face) return;
+        thumbMotion(face, true);
+        paintThumb(face, THUMB_REST);
       }}
       onFocus={() => setHover(true)}
       onBlur={(event) => {
@@ -805,32 +860,45 @@ export function ImageCard({
       <button
         type="button"
         className="shot-hit"
-        draggable={viewer ? undefined : true}
+        draggable={false}
         aria-label={`${item.name}を拡大`}
         aria-expanded={viewer ? undefined : menu}
         onDragStart={onExportDragStart}
-        onDragEnd={onExportDragEnd}
         onClick={(event) => {
           if (suppressClick.current) {
             suppressClick.current = false;
             event.preventDefault();
             return;
           }
+          const open = () => {
+            tiltLive.current = false;
+            if (tiltFrame.current) cancelAnimationFrame(tiltFrame.current);
+            tiltFrame.current = 0;
+            tiltShown.current = THUMB_REST;
+            tiltTarget.current = THUMB_REST;
+            const face = contactRef.current;
+            if (face) {
+              thumbMotion(face, false);
+              paintThumb(face, THUMB_REST);
+            }
+            holdGallerySensor();
+            const media = face?.querySelector("img, video") ?? frameRef.current;
+            onOpen(item.id, zoomRectOf(media) ?? undefined);
+          };
           if (viewer) {
-            onOpen(item.id);
+            open();
             return;
           }
           if (event.metaKey || event.ctrlKey) {
             onToggleSelect(item.id);
             return;
           }
-          const fine = window.matchMedia("(hover: hover) and (pointer: fine)").matches;
-          if (fine) onOpen(item.id);
-          else if (pinned) onOpen(item.id);
-          else setPinned(true);
+          open();
         }}
       >
         <div ref={frameRef} className="shot-frame">
+          <div className="shot-sensor">
+          <div ref={contactRef} className="shot-contact">
           {origin ? <span className="shot-origin">{origin}</span> : null}
           {url && item.mime.startsWith("video/") && !pauseMotion ? (
             <video
@@ -868,6 +936,7 @@ export function ImageCard({
           {hasInk && inkShown && !item.animated ? (
             <InkStill imageId={item.id} revision={inkRev} style={{ ...mediaStyle, objectFit: "fill" }} />
           ) : null}
+          <span className="shot-sheen" aria-hidden="true" />
           {pauseMotion ? (
             <span className="shot-play" aria-hidden="true">
               <svg viewBox="0 0 24 24">
@@ -875,6 +944,8 @@ export function ImageCard({
               </svg>
             </span>
           ) : null}
+          </div>
+          </div>
         </div>
       </button>
       {hasInk && !item.animated ? (

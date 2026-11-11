@@ -1,5 +1,5 @@
 import { ClipboardPaste, Crop, FileDown, Heart, ImagePlus, Play, Shuffle } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { BackupActions, type BackupController } from "@/components/portfolio/backup-actions";
 import { CanvasBoard } from "@/components/portfolio/canvas-board";
 import { captureErrorMessage, captureScreenFrame, SnipOverlay } from "@/components/portfolio/capture-dialog";
@@ -13,13 +13,21 @@ import { QrLinkDialog } from "@/components/portfolio/qr-link-dialog";
 import { SpotConfirm } from "@/components/portfolio/spot-confirm";
 import { StorageDialog } from "@/components/portfolio/storage-dialog";
 import { TagRail } from "@/components/portfolio/tag-rail";
+import { THUMB_CHROME_MS, THUMB_HANDOFF_MS, THUMB_ZOOM_EASE, THUMB_ZOOM_MS, THUMB_ZOOM_PHONE_MS, canThumbZoom, frameInStage, zoomShift, type ZoomRect } from "@/lib/portfolio/thumb-zoom";
+import { considerShake, readAccel, SHAKE_MIN_INTERVAL_MS, SHAKE_REST, SHAKE_SAMPLE, shakePower } from "@/lib/portfolio/device-shake";
+import { poseFromReading, SENSOR_REST } from "@/lib/portfolio/device-tilt";
+import { applyStillTilt, freshStillWatch } from "@/lib/portfolio/sensor-still";
+import { beginPermissionAsk, onMotion, onOrientation, sensorPermits, sensorWatchHot, setWantedSensors, wantedSensors, watchSensorPermits, watchWantedSensors, type SensorPermit } from "@/lib/portfolio/sensor-hub";
+import { armGalleryShuffle, clearGalleryMotion, finishGalleryShake, galleryDecay, galleryImpulse, gallerySensorHeld, holdGallerySensor, markCardsOnScreen, paintGalleryShake, paintGalleryTilt, releaseGallerySensor, SHUFFLE_FADE_MS, SHUFFLE_ROW_MS, SHUFFLE_SLIDE_MS, shuffleEnterRows, shuffleEnterShift } from "@/lib/portfolio/sensor-gallery";
 import { Button } from "@/components/ui/button";
 import { centerSplit } from "@/lib/portfolio/canvas";
 import { selectedLibraryTab, activeLibraryTab, type LibraryTab } from "@/lib/portfolio/db";
+import { dragScrollSpeed, dragScrollStep } from "@/lib/portfolio/drag-scroll";
+import { RETURN_MS, returnPoint } from "@/lib/portfolio/drag-return";
 import { isBackupFileName } from "@/lib/portfolio/backup";
 import { fetchBrowserMedia, pixivBlockedMessage } from "@/lib/portfolio/browser-fetch";
 import { startDesktopFileDrops, desktopDropsListening, type DesktopDrop } from "@/lib/portfolio/desktop-drop";
-import { OWN_FILE_DRAG, SHOT_DRAG } from "@/lib/portfolio/export-file";
+import { OWN_FILE_DRAG, ownFileDragActive, SHOT_DRAG } from "@/lib/portfolio/export-file";
 import { copiedHttpUrl, chooseDroppedPayload, fileFromDataUrl, sniffImage, type DroppedPayload, type ExternalImageSources } from "@/lib/portfolio/image-sniff";
 import {
   boxesInRect,
@@ -41,6 +49,7 @@ import {
   tagsInRailOrder,
   type FlowBox,
   type InsertMark,
+  type TagMatch,
 } from "@/lib/portfolio/logic";
 import { pixivIllustId } from "@/lib/portfolio/pixiv-url";
 import { axisLocked, drawerSpan, edgeGesture, gestureCommits, revealForMove, slideX, type EdgeGesture } from "@/lib/portfolio/phone-edge";
@@ -59,6 +68,7 @@ import {
   deleteTagFolder,
   dismissNotices,
   favoriteImages,
+  getPortfolioState,
   hideTag,
   moveFolder,
   moveImagesToFolder,
@@ -78,6 +88,7 @@ import {
   resetCurrentLibrary,
   retryBootstrap,
   saveFavoritesOnly,
+  saveCssFx,
   saveFolderOpen,
   saveFolderPane,
   saveFolderWidth,
@@ -102,7 +113,7 @@ import {
   usePortfolio,
   viewerLocked,
 } from "@/lib/portfolio/store";
-import { ALL_FOLDERS, TAG_DRAG, type Folder, type ImageMeta } from "@/lib/portfolio/types";
+import { ALL_FOLDERS, DEFAULT_FOLDER_VIEW, TAG_DRAG, type Folder, type ImageMeta } from "@/lib/portfolio/types";
 import { beginTagDrag, currentTagDrag, endTagDrag, eventIsTagDrag } from "@/lib/portfolio/tag-drag";
 import { loadXPostVideo } from "@/lib/portfolio/x-browser";
 import { directVideoUrl, xStatusId } from "@/lib/portfolio/x-url";
@@ -126,6 +137,33 @@ function scopeFolderIds(folders: readonly Folder[], folderId: string): Set<strin
 
 function inScope(item: ImageMeta, scope: Set<string> | null): boolean {
   return scope === null || scope.has(item.folderId);
+}
+
+function shownGallery(input: {
+  items: readonly ImageMeta[];
+  folders: readonly Folder[];
+  folderId: string;
+  hiddenFolderIds: readonly string[];
+  favoritesOnly: boolean;
+  activeTagIds: readonly string[];
+  hiddenTagIds: readonly string[];
+  tagMatch: TagMatch;
+  direction: "asc" | "desc";
+}): ImageMeta[] {
+  if (input.folderId !== ALL_FOLDERS && input.hiddenFolderIds.includes(input.folderId)) return [];
+  const scope = scopeFolderIds(input.folders, input.folderId);
+  const concealed = new Set(input.hiddenFolderIds);
+  const filtered = input.items.filter((item) => {
+    if (!inScope(item, scope)) return false;
+    if (concealed.has(item.folderId)) return false;
+    if (input.favoritesOnly && !item.favorite) return false;
+    return passesTagFilter(item.tagIds, input.activeTagIds, input.hiddenTagIds, input.tagMatch);
+  });
+  return readingSequence(filtered, input.direction);
+}
+
+function galleryKey(ids: readonly string[]): string {
+  return ids.join("\n");
 }
 
 function dragTypes(event: { dataTransfer: DataTransfer | null }): string[] {
@@ -275,7 +313,7 @@ function dropMissMessage(reason: "browser" | "format" | "url"): string {
 }
 
 function isExternalFileDrag(event: { dataTransfer: DataTransfer | null }): boolean {
-  if (galleryFileDrag) return false;
+  if (galleryFileDrag || ownFileDragActive()) return false;
   return isExternalDrop(dragTypes(event));
 }
 
@@ -286,41 +324,101 @@ function popAt(rect: DOMRect): { top: number; left: number } {
   return { top, left };
 }
 
-function placePreview(node: HTMLElement, clientX: number, clientY: number): void {
-  const width = node.offsetWidth;
-  const height = node.offsetHeight;
-  let x = clientX + 18;
-  let y = clientY + 18;
-  if (width > 0 && x + width > window.innerWidth - 8) x = clientX - width - 14;
-  if (height > 0 && y + height > window.innerHeight - 8) y = clientY - height - 14;
-  node.style.transform = `translate3d(${Math.round(x)}px, ${Math.round(y)}px, 0)`;
+function placeFloat(node: HTMLElement, clientX: number, clientY: number, grabX: number, grabY: number): void {
+  node.style.transform = `translate3d(${Math.round(clientX - grabX)}px, ${Math.round(clientY - grabY)}px, 0)`;
 }
 
-function dragPreviewOf(id: string): { src: string; w: number; h: number } {
-  const max = 104;
+const DRAG_CLONE_OPACITY = 0.5;
+
+type DragGhost = {
+  src: string;
+  w: number;
+  h: number;
+  rx: string;
+  ry: string;
+  sx: string;
+  sy: string;
+  so: string;
+  st: string;
+};
+
+type DragReturn = {
+  key: number;
+  id: string;
+  ids: string[];
+  ghost: DragGhost;
+  fromX: number;
+  fromY: number;
+};
+
+function cssVar(node: HTMLElement | null, name: string, fallback: string): string {
+  if (!node) return fallback;
+  const inline = node.style.getPropertyValue(name).trim();
+  if (inline) return inline;
+  const computed = getComputedStyle(node).getPropertyValue(name).trim();
+  return computed || fallback;
+}
+
+function dragGhostOf(id: string, clientX: number, clientY: number): { ghost: DragGhost; grabX: number; grabY: number } {
   const card = document.querySelector(`[data-shot-id="${CSS.escape(id)}"]`);
-  const rect = card?.getBoundingClientRect();
-  const aspect = rect && rect.height > 0 ? rect.width / rect.height : 1;
-  const w = aspect >= 1 ? max : Math.max(32, Math.round(max * aspect));
-  const h = aspect >= 1 ? Math.max(32, Math.round(max / aspect)) : max;
+  const rect = card instanceof HTMLElement ? card.getBoundingClientRect() : null;
+  const w = rect && rect.width > 0 ? Math.round(rect.width) : 104;
+  const h = rect && rect.height > 0 ? Math.round(rect.height) : 104;
+  const contact = card?.querySelector(".shot-contact");
+  const face = contact instanceof HTMLElement ? contact : null;
+  let src = "";
   const image = card?.querySelector("img");
-  if (image instanceof HTMLImageElement && image.currentSrc) return { src: image.currentSrc, w, h };
-  const video = card?.querySelector("video");
-  if (video instanceof HTMLVideoElement && video.readyState >= 2 && video.videoWidth > 0) {
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.max(1, w);
-    canvas.height = Math.max(1, h);
-    const context = canvas.getContext("2d");
-    if (context) {
-      context.drawImage(video, 0, 0, canvas.width, canvas.height);
-      try {
-        return { src: canvas.toDataURL("image/jpeg", 0.72), w, h };
-      } catch {
-        /* a tainted frame still gets an empty preview */
+  if (image instanceof HTMLImageElement && image.currentSrc) src = image.currentSrc;
+  else {
+    const video = card?.querySelector("video");
+    if (video instanceof HTMLVideoElement && video.readyState >= 2 && video.videoWidth > 0) {
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, w);
+      canvas.height = Math.max(1, h);
+      const context = canvas.getContext("2d");
+      if (context) {
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        try {
+          src = canvas.toDataURL("image/jpeg", 0.72);
+        } catch {
+          src = "";
+        }
       }
     }
   }
-  return { src: "", w, h };
+  return {
+    ghost: {
+      src,
+      w,
+      h,
+      rx: cssVar(face, "--thumb-rx", "0deg"),
+      ry: cssVar(face, "--thumb-ry", "0deg"),
+      sx: cssVar(face, "--thumb-sx", "0%"),
+      sy: cssVar(face, "--thumb-sy", "0%"),
+      so: cssVar(face, "--thumb-so", "0"),
+      st: cssVar(face, "--thumb-st", "0deg"),
+    },
+    grabX: rect ? clientX - rect.left : w / 2,
+    grabY: rect ? clientY - rect.top : h / 2,
+  };
+}
+
+function folderDropVerdict(ids: readonly string[], folderId: string): "move" | "parent" | "reject" {
+  const current = getPortfolioState();
+  const destination = current.folders.find((folder) => folder.id === folderId);
+  if (!destination) return "reject";
+  if (destination.isParent) return "parent";
+  const wanted = new Set(ids);
+  if (!current.items.some((item) => wanted.has(item.id) && item.folderId !== folderId)) return "reject";
+  return "move";
+}
+
+function visibleOrderMatches(order: readonly string[]): boolean {
+  const visible = new Set(order);
+  const slots = getPortfolioState()
+    .items.filter((item) => visible.has(item.id))
+    .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
+  return slots.map((item) => item.id).join("|") === order.join("|");
 }
 
 function LibraryTabButtons({
@@ -361,12 +459,14 @@ export function PortfolioScreen() {
   const bootError = usePortfolio((state) => state.bootError);
   const columns = usePortfolio((state) => state.columns);
   const direction = usePortfolio((state) => state.direction);
+  const folderViews = usePortfolio((state) => state.views);
   const folders = usePortfolio((state) => state.folders);
   const folderId = usePortfolio((state) => state.folderId);
   const folderWidth = usePortfolio((state) => state.folderWidth);
   const folderPane = usePortfolio((state) => state.folderPane);
   const folderOpen = usePortfolio((state) => state.folderOpen);
   const favoritesOnly = usePortfolio((state) => state.favoritesOnly);
+  const cssFx = usePortfolio((state) => state.cssFx);
   const tags = usePortfolio((state) => state.tags);
   const tagFolders = usePortfolio((state) => state.tagFolders);
   const activeTagIds = usePortfolio((state) => state.activeTagIds);
@@ -383,6 +483,9 @@ export function PortfolioScreen() {
   const tabRequest = useRef(0);
 
   const [compact, setCompact] = useState(false);
+  useEffect(() => {
+    document.documentElement.classList.toggle("css-fx", cssFx);
+  }, [cssFx]);
   const [phonePane, setPhonePane] = useState<PhonePane>(null);
   const [gifMotion, setGifMotion] = useState(true);
   const [canvasMode, setCanvasMode] = useState(false);
@@ -406,6 +509,19 @@ export function PortfolioScreen() {
   const [contentPx, setContentPx] = useState(0);
   const [selected, setSelected] = useState<string[]>([]);
   const [openId, setOpenId] = useState<string | null>(null);
+  const [tiltBox, setTiltBox] = useState<{ left: number; top: number } | null>(null);
+  const [tiltRun, setTiltRun] = useState(false);
+  const [shakeRun, setShakeRun] = useState(false);
+  const [sensorPermit, setSensorPermit] = useState<{ orientation: SensorPermit; motion: SensorPermit }>({ orientation: "unknown", motion: "unknown" });
+  const [sensorHot, setSensorHot] = useState(false);
+  const [sensorStopAsk, setSensorStopAsk] = useState(false);
+  const shuffleLock = useRef(false);
+  const swapGen = useRef(0);
+  const swapTimers = useRef<number[]>([]);
+  const beginShuffleRef = useRef<() => void>(() => {});
+  const playListSwapRef = useRef<(nextIds: readonly string[], apply: () => void | Promise<void>, resetScroll: boolean) => void>(() => {});
+  const [zoomLaunch, setZoomLaunch] = useState<{ id: string; from: ZoomRect; width: number; height: number; phone: boolean } | null>(null);
+  const zooming = useRef(false);
   const [pdfOpen, setPdfOpen] = useState(false);
   const [slideshowOpen, setSlideshowOpen] = useState(false);
   const slideshowAnchorRef = useRef<HTMLSpanElement>(null);
@@ -422,7 +538,9 @@ export function PortfolioScreen() {
   const [marquee, setMarquee] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [dragId, setDragId] = useState<string | null>(null);
   const [insertMarks, setInsertMarks] = useState<InsertMark[]>([]);
-  const [dragPreview, setDragPreview] = useState<{ src: string; w: number; h: number } | null>(null);
+  const [dragPreview, setDragPreview] = useState<DragGhost | null>(null);
+  const [dragFloatKey, setDragFloatKey] = useState(0);
+  const [dragReturns, setDragReturns] = useState<DragReturn[]>([]);
   const [dropFolderId, setDropFolderId] = useState<string | null>(null);
   const [flashId, setFlashId] = useState<string | null>(null);
   const [flashFade, setFlashFade] = useState(false);
@@ -443,6 +561,17 @@ export function PortfolioScreen() {
   const desktopDropRef = useRef<(drop: DesktopDrop) => void>(() => {});
   const backupRef = useRef<BackupController>(null);
   const previewRef = useRef<HTMLDivElement>(null);
+  const grabRef = useRef({ x: 0, y: 0 });
+  const dragEpoch = useRef(0);
+  const dragGhostRef = useRef<DragGhost | null>(null);
+  const dragReturnsRef = useRef<DragReturn[]>([]);
+  const returnNodes = useRef(new Map<number, HTMLDivElement>());
+  const returnFrames = useRef(new Map<number, number>());
+  const returnAlive = useRef(new Map<number, { on: boolean }>());
+  const returnBinders = useRef(new Map<number, (node: HTMLDivElement | null) => void>());
+  const returnSeq = useRef(0);
+  const cancelAllReturnsRef = useRef<() => void>(() => {});
+  const startReturnFlightRef = useRef<(item: DragReturn, node: HTMLDivElement) => void>(() => {});
   const dragPointRef = useRef<{ x: number; y: number } | null>(null);
   const canvasDropRef = useRef(false);
   const markKeyRef = useRef("");
@@ -477,6 +606,8 @@ export function PortfolioScreen() {
   }, []);
 
   useEffect(() => {
+    dragCleanup.current?.();
+    cancelAllReturnsRef.current();
     setSelected([]);
     setOpenId(null);
     setPdfOpen(false);
@@ -497,8 +628,10 @@ export function PortfolioScreen() {
     const node = previewRef.current;
     const point = dragPointRef.current;
     if (!node || !point) return;
-    placePreview(node, point.x, point.y);
-  }, [dragPreview]);
+    node.style.transition = "none";
+    node.style.opacity = String(DRAG_CLONE_OPACITY);
+    placeFloat(node, point.x, point.y, grabRef.current.x, grabRef.current.y);
+  }, [dragPreview, dragFloatKey]);
 
   useLayoutEffect(() => {
     const take = () => {
@@ -759,7 +892,10 @@ export function PortfolioScreen() {
   }, []);
 
   useEffect(() => {
-    return () => dragCleanup.current?.();
+    return () => {
+      dragCleanup.current?.();
+      cancelAllReturnsRef.current();
+    };
   }, []);
 
   useEffect(() => {
@@ -777,23 +913,33 @@ export function PortfolioScreen() {
   const scopedItems = useMemo(() => items.filter((item) => inScope(item, scope)), [items, scope]);
   const hasFavorite = scopedItems.some((item) => item.favorite);
   const selectedFolderHidden = folderId !== ALL_FOLDERS && hiddenFolderIds.includes(folderId);
-  const visible = useMemo(() => {
-    if (selectedFolderHidden) return [];
-    const concealed = new Set(hiddenFolderIds);
-    const filtered = scopedItems.filter((item) => {
-      if (concealed.has(item.folderId)) return false;
-      if (favoritesOnly && !item.favorite) return false;
-      return passesTagFilter(item.tagIds, activeTagIds, hiddenTagIds, tagMatch);
-    });
-    return readingSequence(filtered, direction);
-  }, [scopedItems, selectedFolderHidden, hiddenFolderIds, favoritesOnly, activeTagIds, hiddenTagIds, tagMatch, direction]);
+  const galleryInput = {
+    items,
+    folders,
+    folderId,
+    hiddenFolderIds,
+    favoritesOnly,
+    activeTagIds,
+    hiddenTagIds,
+    tagMatch,
+    direction,
+  };
+  const visible = useMemo(
+    () => shownGallery(galleryInput),
+    [items, folders, folderId, hiddenFolderIds, favoritesOnly, activeTagIds, hiddenTagIds, tagMatch, direction],
+  );
 
   useEffect(() => {
     if (phase !== "ready" || !favoritesOnly || hasFavorite || clearingFavorite.current) return;
     clearingFavorite.current = true;
-    void saveFavoritesOnly(false).finally(() => {
-      clearingFavorite.current = false;
-    });
+    const next = shownGallery({ ...galleryInput, favoritesOnly: false });
+    playListSwapRef.current(
+      next.map((item) => item.id),
+      () => saveFavoritesOnly(false).finally(() => {
+        clearingFavorite.current = false;
+      }),
+      compact,
+    );
   }, [phase, favoritesOnly, hasFavorite]);
 
   useEffect(() => {
@@ -915,6 +1061,290 @@ export function PortfolioScreen() {
     return () => window.cancelAnimationFrame(frame);
   }, [openId]);
 
+  useEffect(() => {
+    const launch = zoomLaunch;
+    if (!launch) return;
+    zooming.current = true;
+    document.body.classList.add("is-shot-zoom");
+    document.body.style.setProperty("--shot-chrome", `${THUMB_CHROME_MS}ms`);
+    document.body.style.setProperty("--shot-handoff", `${THUMB_HANDOFF_MS}ms`);
+    const zoomMs = launch.phone ? THUMB_ZOOM_PHONE_MS : THUMB_ZOOM_MS;
+    let flyer: HTMLElement | null = null;
+    let timer = 0;
+    let frame = 0;
+    let ended = false;
+    const finish = () => {
+      if (ended) return;
+      ended = true;
+      window.clearTimeout(timer);
+      document.body.classList.remove("is-shot-zoom", "is-shot-handoff");
+      flyer?.remove();
+      flyer = null;
+      zooming.current = false;
+      setZoomLaunch(null);
+    };
+    const lightboxMedia = () => {
+      const node = document.querySelector(".lightbox-stage img, .lightbox-stage video");
+      if (node instanceof HTMLImageElement && node.complete && node.naturalWidth > 0) return node;
+      if (node instanceof HTMLVideoElement && node.readyState >= 2) return node;
+      return null;
+    };
+    const kickDecode = () => {
+      const node = document.querySelector(".lightbox-stage img");
+      if (node instanceof HTMLImageElement && node.decode) void node.decode().catch(() => undefined);
+    };
+    const handoff = () => {
+      if (ended || !flyer) {
+        finish();
+        return;
+      }
+      const media = lightboxMedia();
+      if (media) {
+        const box = media.getBoundingClientRect();
+        if (box.width >= 2 && box.height >= 2) {
+          flyer.style.transition = "none";
+          flyer.style.transform = "none";
+          flyer.style.left = `${box.left}px`;
+          flyer.style.top = `${box.top}px`;
+          flyer.style.width = `${box.width}px`;
+          flyer.style.height = `${box.height}px`;
+        }
+      }
+      document.body.classList.add("is-shot-handoff");
+      if (!launch.phone) {
+        frame = window.requestAnimationFrame(() => {
+          frame = window.requestAnimationFrame(finish);
+        });
+        return;
+      }
+      timer = window.setTimeout(() => {
+        if (ended || !flyer) {
+          finish();
+          return;
+        }
+        flyer.style.willChange = "opacity";
+        flyer.style.transition = `opacity ${THUMB_HANDOFF_MS}ms linear`;
+        flyer.style.opacity = "0";
+        const onFade = (event: TransitionEvent) => {
+          if (event.target !== flyer || event.propertyName !== "opacity") return;
+          finish();
+        };
+        flyer.addEventListener("transitionend", onFade);
+        timer = window.setTimeout(finish, THUMB_HANDOFF_MS + 80);
+      }, THUMB_HANDOFF_MS);
+    };
+    let waiting = false;
+    const waitForPicture = (left: number) => {
+      if (ended || waiting) return;
+      waiting = true;
+      const step = (n: number) => {
+        if (ended) return;
+        kickDecode();
+        if (lightboxMedia() || n <= 0) {
+          handoff();
+          return;
+        }
+        timer = window.setTimeout(() => step(n - 1), 50);
+      };
+      step(left);
+    };
+    const fly = (dest: ZoomRect) => {
+      const shift = zoomShift(launch.from, dest);
+      const existing = document.querySelector(".shot-zoom");
+      if (!shift || !(existing instanceof HTMLElement)) {
+        finish();
+        return;
+      }
+      flyer = existing;
+      const go = () => {
+        if (ended || !flyer) return;
+        flyer.style.willChange = "transform";
+        flyer.style.transition = `transform ${zoomMs}ms ${THUMB_ZOOM_EASE}`;
+        flyer.style.transform = `translate(${shift.x}px, ${shift.y}px) scale(${shift.sx}, ${shift.sy})`;
+        const onEnd = (event: TransitionEvent) => {
+          if (event.target !== flyer || event.propertyName !== "transform") return;
+          waitForPicture(24);
+        };
+        flyer.addEventListener("transitionend", onEnd);
+        timer = window.setTimeout(() => waitForPicture(24), zoomMs + 80);
+      };
+      if (launch.phone) {
+        flyer.style.transform = "translate(0px, 0px) scale(1)";
+        frame = window.requestAnimationFrame(() => {
+          frame = window.requestAnimationFrame(go);
+        });
+        return;
+      }
+      flyer.getBoundingClientRect();
+      go();
+    };
+    const findDest = (tries: number) => {
+      if (ended) return;
+      kickDecode();
+      const stage = document.querySelector(".lightbox-stage");
+      const media = stage?.querySelector("img, video");
+      let dest: ZoomRect | null = null;
+      if (media instanceof HTMLElement) {
+        const box = media.getBoundingClientRect();
+        if (box.width >= 2 && box.height >= 2) dest = { left: box.left, top: box.top, width: box.width, height: box.height };
+      }
+      if (!dest && stage instanceof HTMLElement) {
+        const box = stage.getBoundingClientRect();
+        dest = frameInStage({ left: box.left, top: box.top, width: box.width, height: box.height }, launch.width, launch.height);
+      }
+      if (dest) {
+        fly(dest);
+        return;
+      }
+      if (tries >= (launch.phone ? 24 : 8)) {
+        waitForPicture(24);
+        return;
+      }
+      frame = window.requestAnimationFrame(() => findDest(tries + 1));
+    };
+    frame = window.requestAnimationFrame(() => findDest(0));
+    return () => {
+      ended = true;
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timer);
+      flyer?.remove();
+      document.querySelector(".shot-zoom")?.remove();
+      document.body.classList.remove("is-shot-zoom", "is-shot-handoff");
+      zooming.current = false;
+    };
+  }, [zoomLaunch]);
+
+  useEffect(() => {
+    setSensorPermit(sensorPermits());
+    const stopPermits = watchSensorPermits(() => setSensorPermit(sensorPermits()));
+    const stopWant = watchWantedSensors(() => {
+      const want = wantedSensors();
+      setTiltRun(want.tilt);
+      setShakeRun(want.shake);
+    });
+    return () => {
+      stopPermits();
+      stopWant();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!tiltRun && !shakeRun) {
+      setSensorHot(false);
+      setSensorStopAsk(false);
+      return;
+    }
+    const tick = () => setSensorHot(sensorWatchHot(performance.now(), wantedSensors(), sensorPermits()));
+    tick();
+    const id = window.setInterval(tick, 400);
+    return () => window.clearInterval(id);
+  }, [tiltRun, shakeRun, sensorPermit]);
+
+  useEffect(() => {
+    const node = flowRef.current;
+    if (!compact || openId || (!tiltRun && !shakeRun)) {
+      if (node) clearGalleryMotion(node);
+      return;
+    }
+    releaseGallerySensor();
+    if (!node) return;
+    const view = scrollRef.current ?? node;
+    markCardsOnScreen(node, view);
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) entry.target.classList.toggle("is-on-screen", entry.isIntersecting);
+      },
+      { root: scrollRef.current, rootMargin: "80px" },
+    );
+    for (const card of node.querySelectorAll(".shot-card")) observer.observe(card);
+    let baseline: { beta: number; gamma: number } | null = null;
+    let still = freshStillWatch();
+    let lastTilt = 0;
+    let shown = SENSOR_REST;
+    let shaking = SHAKE_REST;
+    let sample = SHAKE_SAMPLE;
+    let lastImpulse = 0;
+    let flip = false;
+    let frame = 0;
+    let last = 0;
+    let armed = false;
+    const paintTilt = () => {
+      const flow = flowRef.current;
+      if (!flow || gallerySensorHeld() || !tiltRun) return;
+      paintGalleryTilt(flow, shown);
+    };
+    const paintShake = () => {
+      const flow = flowRef.current;
+      if (!flow || gallerySensorHeld() || !shakeRun) return;
+      paintGalleryShake(flow, shaking);
+    };
+    const stopTilt = tiltRun
+      ? onOrientation((reading) => {
+          const now = performance.now();
+          const pose = poseFromReading(reading.beta, reading.gamma);
+          if (!pose) return;
+          if (!baseline) {
+            baseline = pose;
+            shown = SENSOR_REST;
+            still = { anchor: pose, since: now, settling: false };
+            lastTilt = now;
+            paintTilt();
+            return;
+          }
+          const step = applyStillTilt({ watch: still, baseline, shown, pose, now, dt: lastTilt ? now - lastTilt : 32 });
+          still = step.watch;
+          baseline = step.baseline;
+          shown = step.shown;
+          lastTilt = now;
+          paintTilt();
+        })
+      : () => undefined;
+    const tick = (now: number) => {
+      const dt = last ? Math.min(48, now - last) : 16;
+      last = now;
+      shaking = galleryDecay(shaking, dt);
+      paintShake();
+      if (shaking !== SHAKE_REST) {
+        frame = window.requestAnimationFrame(tick);
+        return;
+      }
+      frame = 0;
+      const done = finishGalleryShake(armed);
+      armed = done.armed;
+      if (done.shuffle) beginShuffleRef.current();
+    };
+    const stopShakeListen = shakeRun
+      ? onMotion((motion) => {
+          if (shuffleLock.current) return;
+          const reading = readAccel(motion.acceleration, motion.accelerationIncludingGravity);
+          if (!reading) return;
+          const now = performance.now();
+          const judged = considerShake(sample, reading, now);
+          sample = judged.next;
+          const power = shakePower(judged.delta);
+          if (power <= 0 || now - lastImpulse < SHAKE_MIN_INTERVAL_MS) return;
+          lastImpulse = now;
+          flip = !flip;
+          armed = armGalleryShuffle(armed, shuffleLock.current);
+          if (!armed) return;
+          shaking = galleryImpulse(power, flip);
+          if (!frame) {
+            last = now;
+            frame = window.requestAnimationFrame(tick);
+          }
+        })
+      : () => undefined;
+    paintTilt();
+    paintShake();
+    return () => {
+      stopTilt();
+      stopShakeListen();
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+      if (flowRef.current) clearGalleryMotion(flowRef.current);
+    };
+  }, [compact, openId, tiltRun, shakeRun, visible.length]);
+
   const fitted = fitColumns(columns, contentPx, 148, GALLERY_GAP_PX);
   const flow = useMemo(
     () => layoutFlow(
@@ -925,6 +1355,132 @@ export function PortfolioScreen() {
   );
   const placements = flow.placements;
   placementsRef.current = placements;
+  const clearSwapTimers = () => {
+    for (const id of swapTimers.current) window.clearTimeout(id);
+    swapTimers.current = [];
+  };
+  const finishSwapMotion = (node: HTMLElement | null, view: HTMLElement | null) => {
+    if (node) {
+      for (const card of node.querySelectorAll(".shot-card")) {
+        if (!(card instanceof HTMLElement)) continue;
+        card.classList.remove("is-shuffle-in", "is-shuffle-far");
+        card.style.removeProperty("--shuffle-row");
+        card.style.removeProperty("--shuffle-x");
+      }
+      node.classList.remove("is-shuffle-out", "is-shuffle-run");
+    }
+    view?.classList.remove("is-shuffle-clip");
+    shuffleLock.current = false;
+  };
+  playListSwapRef.current = (nextIds, apply, resetScroll) => {
+    const before = galleryKey(visible.map((item) => item.id));
+    if (galleryKey(nextIds) === before) {
+      void apply();
+      return;
+    }
+    const scroller = scrollRef.current;
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (phase !== "ready" || reduce) {
+      if (reduce && resetScroll && compact && scroller) scroller.scrollTop = 0;
+      void apply();
+      return;
+    }
+    const gen = ++swapGen.current;
+    clearSwapTimers();
+    const flowNode = flowRef.current;
+    finishSwapMotion(flowNode, scroller);
+    shuffleLock.current = true;
+    flowNode?.classList.add("is-shuffle-out");
+    if (!compact) {
+      flowNode?.classList.add("is-shuffle-run");
+      scroller?.classList.add("is-shuffle-clip");
+      window.dispatchEvent(new CustomEvent("komacho-thumb-rest"));
+    }
+    const later = (fn: () => void, ms: number) => {
+      const id = window.setTimeout(fn, ms);
+      swapTimers.current.push(id);
+    };
+    if (resetScroll) {
+      later(() => {
+        if (swapGen.current !== gen) return;
+        if (scrollRef.current) scrollRef.current.scrollTop = 0;
+      }, 100);
+    }
+    later(() => {
+      if (swapGen.current !== gen) return;
+      void Promise.resolve(apply()).finally(() => {
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => {
+            if (swapGen.current !== gen) return;
+            const node = flowRef.current;
+            const view = scrollRef.current;
+            if (!node || !view) {
+              finishSwapMotion(node, view);
+              return;
+            }
+            const cards = [...node.querySelectorAll(".shot-card")].filter((card): card is HTMLElement => card instanceof HTMLElement);
+            const shown = galleryKey(cards.map((card) => card.dataset.shotId ?? ""));
+            if (shown === before || cards.length === 0) {
+              finishSwapMotion(node, view);
+              return;
+            }
+            const box = view.getBoundingClientRect();
+            const plan = shuffleEnterRows(
+              cards.map((card) => {
+                const rect = card.getBoundingClientRect();
+                return { top: rect.top, bottom: rect.bottom };
+              }),
+              box.top,
+              box.bottom,
+            );
+            let maxRow = 0;
+            cards.forEach((card, index) => {
+              const row = plan[index] ?? -1;
+              if (row < 0) return;
+              maxRow = Math.max(maxRow, row);
+              if (!compact) {
+                const rect = card.getBoundingClientRect();
+                card.style.setProperty("--shuffle-x", `${shuffleEnterShift(rect.left, box.right, rect.width)}px`);
+                card.classList.add("is-shuffle-far");
+              }
+              card.classList.add("is-shuffle-in");
+              card.style.setProperty("--shuffle-row", String(row));
+            });
+            node.classList.remove("is-shuffle-out");
+            later(() => {
+              if (swapGen.current !== gen) return;
+              finishSwapMotion(node, view);
+            }, SHUFFLE_SLIDE_MS + maxRow * SHUFFLE_ROW_MS + 40);
+          });
+        });
+      });
+    }, SHUFFLE_FADE_MS);
+  };
+  beginShuffleRef.current = () => {
+    if (phase !== "ready" || visible.length < 2 || shuffleLock.current) return;
+    const shuffled = shuffleIds(visible.map((item) => item.id));
+    const stored = direction === "desc" ? shuffled.slice().reverse() : shuffled;
+    playListSwapRef.current(shuffled, () => {
+      if (compact && window.matchMedia("(prefers-reduced-motion: reduce)").matches && scrollRef.current) scrollRef.current.scrollTop = 0;
+      setVisibleOrder(stored, compact);
+      void commitImageOrder(compact);
+    }, true);
+  };
+  const swapFilters = (patch: Partial<typeof galleryInput>, apply: () => void | Promise<void>) => {
+    const next = shownGallery({ ...galleryInput, ...patch });
+    playListSwapRef.current(
+      next.map((item) => item.id),
+      apply,
+      compact,
+    );
+  };
+  useEffect(() => {
+    return () => {
+      swapGen.current += 1;
+      for (const id of swapTimers.current) window.clearTimeout(id);
+      swapTimers.current = [];
+    };
+  }, []);
 
   useEffect(() => {
     const node = flowRef.current;
@@ -964,8 +1520,65 @@ export function PortfolioScreen() {
     : null;
   const openIndex = openItem ? readingIds.indexOf(openItem.id) : -1;
 
-  const openAt = (id: string) => {
+  const tiltLabel = sensorHot ? "利用中" : tiltRun || shakeRun ? "停止中" : sensorPermit.orientation === "unknown" && sensorPermit.motion === "unknown" ? "未許可" : "停止中";
+  const onTiltMenu = (event: { currentTarget: HTMLButtonElement }) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    setTiltBox({ left: rect.left, top: rect.bottom + 6 });
+    if (sensorHot) {
+      setSensorStopAsk(true);
+      return;
+    }
+    const asked = beginPermissionAsk(window);
+    void Promise.all([asked.orientation, asked.motion]).then(([orientation, motion]) => {
+      setSensorPermit(sensorPermits());
+      if (orientation === "granted" || motion === "granted") {
+        setWantedSensors({ tilt: orientation === "granted", shake: motion === "granted" });
+      }
+    });
+  };
+
+  const openAt = (id: string, from?: ZoomRect) => {
+    if (zooming.current || document.body.classList.contains("is-shot-zoom")) return;
     if (!openId) galleryScroll.current = scrollRef.current?.scrollTop ?? 0;
+    const reduced = typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const picture = items.find((entry) => entry.id === id);
+    const source = from ?? null;
+    if (picture && canThumbZoom(reduced, source)) {
+      zooming.current = true;
+      document.body.classList.add("is-shot-zoom");
+      document.body.style.setProperty("--shot-chrome", `${THUMB_CHROME_MS}ms`);
+      const card = document.querySelector(`[data-shot-id="${CSS.escape(id)}"]`);
+      const media = card?.querySelector("img, video");
+      const src = media instanceof HTMLImageElement || media instanceof HTMLVideoElement ? media.currentSrc || media.src : "";
+      if (src) {
+        const flyer = document.createElement("div");
+        flyer.className = "shot-zoom";
+        flyer.style.transition = "none";
+        flyer.style.left = `${source.left}px`;
+        flyer.style.top = `${source.top}px`;
+        flyer.style.width = `${source.width}px`;
+        flyer.style.height = `${source.height}px`;
+        if (media instanceof HTMLVideoElement) {
+          const video = document.createElement("video");
+          video.src = src;
+          video.muted = true;
+          video.playsInline = true;
+          try {
+            video.currentTime = media.currentTime;
+          } catch {
+            /* the clone can start at zero */
+          }
+          flyer.appendChild(video);
+        } else {
+          const image = document.createElement("img");
+          image.src = src;
+          image.alt = "";
+          flyer.appendChild(image);
+        }
+        document.body.appendChild(flyer);
+      }
+      setZoomLaunch({ id, from: source, width: picture.width, height: picture.height, phone: compact });
+    }
     setOpenId(id);
   };
   const openInk = (id: string) => {
@@ -1034,7 +1647,8 @@ export function PortfolioScreen() {
     }
     if (!inScope(item, scope)) {
       pendingJump.current = id;
-      void selectFolder(item.folderId);
+      const view = folderViews[item.folderId] ?? DEFAULT_FOLDER_VIEW;
+      swapFilters({ folderId: item.folderId, direction: view.direction }, () => selectFolder(item.folderId));
       return;
     }
     if (favoritesOnly && !item.favorite) {
@@ -1193,33 +1807,146 @@ export function PortfolioScreen() {
     void saveCanvasSplit(0.5);
   };
 
+  const stopReturn = (key: number) => {
+    const alive = returnAlive.current.get(key);
+    if (alive) alive.on = false;
+    const frame = returnFrames.current.get(key);
+    if (frame) cancelAnimationFrame(frame);
+    returnFrames.current.delete(key);
+    returnAlive.current.delete(key);
+  };
+  const dropReturn = (key: number) => {
+    stopReturn(key);
+    if (!dragReturnsRef.current.some((item) => item.key === key)) return;
+    const next = dragReturnsRef.current.filter((item) => item.key !== key);
+    dragReturnsRef.current = next;
+    setDragReturns(next);
+  };
+  const cancelReturnsFor = (imageId: string) => {
+    const doomed = dragReturnsRef.current.filter((item) => item.ids.includes(imageId));
+    if (doomed.length === 0) return;
+    for (const item of doomed) stopReturn(item.key);
+    const next = dragReturnsRef.current.filter((item) => !item.ids.includes(imageId));
+    dragReturnsRef.current = next;
+    setDragReturns(next);
+  };
+  const cancelAllReturns = () => {
+    for (const item of dragReturnsRef.current) stopReturn(item.key);
+    if (dragReturnsRef.current.length === 0) return;
+    dragReturnsRef.current = [];
+    setDragReturns([]);
+  };
+  cancelAllReturnsRef.current = cancelAllReturns;
+  startReturnFlightRef.current = (item, node) => {
+    if (returnAlive.current.has(item.key)) return;
+    const alive = { on: true };
+    returnAlive.current.set(item.key, alive);
+    node.style.transition = "none";
+    node.style.opacity = String(DRAG_CLONE_OPACITY);
+    node.style.transform = `translate3d(${Math.round(item.fromX)}px, ${Math.round(item.fromY)}px, 0)`;
+    const started = performance.now();
+    const tick = (now: number) => {
+      if (!alive.on) return;
+      if (!dragReturnsRef.current.some((entry) => entry.key === item.key)) {
+        alive.on = false;
+        return;
+      }
+      const current = returnNodes.current.get(item.key);
+      if (!current) {
+        const retry = requestAnimationFrame(tick);
+        if (!alive.on) {
+          cancelAnimationFrame(retry);
+          return;
+        }
+        returnFrames.current.set(item.key, retry);
+        return;
+      }
+      const card = document.querySelector(`[data-shot-id="${CSS.escape(item.id)}"]`);
+      if (!(card instanceof HTMLElement) || !card.isConnected) {
+        dropReturn(item.key);
+        return;
+      }
+      const t = Math.min(1, (now - started) / RETURN_MS);
+      const home = card.getBoundingClientRect();
+      const point = returnPoint({ x: item.fromX, y: item.fromY }, { x: home.left, y: home.top }, t);
+      current.style.transition = "none";
+      current.style.opacity = String(DRAG_CLONE_OPACITY);
+      current.style.transform = `translate3d(${Math.round(point.x)}px, ${Math.round(point.y)}px, 0)`;
+      if (t >= 1) {
+        dropReturn(item.key);
+        return;
+      }
+      const handle = requestAnimationFrame(tick);
+      if (!alive.on) {
+        cancelAnimationFrame(handle);
+        return;
+      }
+      returnFrames.current.set(item.key, handle);
+    };
+    const handle = requestAnimationFrame(tick);
+    if (!alive.on) {
+      cancelAnimationFrame(handle);
+      return;
+    }
+    returnFrames.current.set(item.key, handle);
+  };
+  const binderFor = (key: number) => {
+    let binder = returnBinders.current.get(key);
+    if (!binder) {
+      binder = (node) => {
+        if (!node) {
+          returnNodes.current.delete(key);
+          return;
+        }
+        returnNodes.current.set(key, node);
+        if (returnAlive.current.has(key)) return;
+        const flight = dragReturnsRef.current.find((entry) => entry.key === key);
+        if (!flight) return;
+        startReturnFlightRef.current(flight, node);
+      };
+      returnBinders.current.set(key, binder);
+    }
+    return binder;
+  };
+
   const movingIds = dragId && selected.includes(dragId) && selected.length > 1 ? selected : dragId ? [dragId] : [];
   const ownerFolders = new Set(movingIds.map((id) => items.find((item) => item.id === id)?.folderId).filter((id): id is string => !!id));
   const ownerFolderId = ownerFolders.size === 1 ? [...ownerFolders][0]! : null;
+  const returningIds = new Set(dragReturns.flatMap((item) => item.ids));
 
   const onCardDragStart = (id: string, event: PointerEvent) => {
-    beginCardDrag(id, event.clientX, event.clientY, "pointer");
+    beginCardDrag(id, event.clientX, event.clientY);
     event.preventDefault();
   };
 
-  const onExternalDrag = (id: string, point: { x: number; y: number }) => {
-    beginCardDrag(id, point.x, point.y, "native");
-  };
-
-  const beginCardDrag = (id: string, clientX: number, clientY: number, source: "pointer" | "native") => {
-    if (compact || viewerLocked()) return;
+  const beginCardDrag = (id: string, clientX: number, clientY: number) => {
+    if (compact) return;
+    cancelReturnsFor(id);
     dragCleanup.current?.();
-    if (source === "native") galleryFileDrag = true;
+    const epoch = ++dragEpoch.current;
     const group = selectedRef.current.includes(id) && selectedRef.current.length > 1 ? [...selectedRef.current] : [id];
+    const faced = dragGhostOf(id, clientX, clientY);
+    dragGhostRef.current = faced.ghost;
+    grabRef.current = { x: faced.grabX, y: faced.grabY };
     dragPointRef.current = { x: clientX, y: clientY };
     canvasDropRef.current = false;
     markKeyRef.current = "";
     folderHoldRef.current = null;
     dropRef.current = { folder: null, index: null };
     setDragId(id);
-    setDragPreview(source === "pointer" ? dragPreviewOf(id) : null);
+    setDragPreview(faced.ghost);
+    setDragFloatKey((key) => key + 1);
     setInsertMarks([]);
     setDropFolderId(null);
+    const paintFollow = (x: number, y: number) => {
+      dragPointRef.current = { x, y };
+      if (dragEpoch.current !== epoch) return;
+      const previewNode = previewRef.current;
+      if (!previewNode) return;
+      previewNode.style.transition = "none";
+      previewNode.style.opacity = String(DRAG_CLONE_OPACITY);
+      placeFloat(previewNode, x, y, grabRef.current.x, grabRef.current.y);
+    };
     const showMarks = (marks: InsertMark[]) => {
       const key = marks.map((mark) => `${mark.id}:${mark.edge}`).join("|");
       if (key === markKeyRef.current) return;
@@ -1231,10 +1958,7 @@ export function PortfolioScreen() {
       folderHoldRef.current = folder;
       setDropFolderId(folder);
     };
-    const moveTo = (x: number, y: number) => {
-      dragPointRef.current = { x, y };
-      const previewNode = previewRef.current;
-      if (previewNode) placePreview(previewNode, x, y);
+    const syncDrop = (x: number, y: number) => {
       const hit = document.elementFromPoint(x, y);
       const overCanvas = Boolean(hit?.closest(".canvas-pane"));
       if (overCanvas && !canvasDropRef.current) {
@@ -1266,50 +1990,179 @@ export function PortfolioScreen() {
       dropRef.current = { folder: null, index: slot ? slot.index : null };
       showMarks(slot?.marks ?? []);
     };
+    const moveTo = (x: number, y: number) => {
+      paintFollow(x, y);
+      syncDrop(x, y);
+    };
     let finished = false;
+    let detached = false;
+    let scrollFrame = 0;
+    let scrollStamp = 0;
+    const stopScroll = () => {
+      if (scrollFrame) cancelAnimationFrame(scrollFrame);
+      scrollFrame = 0;
+    };
+    const runScroll = (now: number) => {
+      scrollFrame = 0;
+      if (finished || dragEpoch.current !== epoch) return;
+      const point = dragPointRef.current;
+      const scroller = scrollRef.current;
+      if (!point || !scroller) return;
+      const bounds = scroller.getBoundingClientRect();
+      const inside =
+        point.x >= bounds.left &&
+        point.x <= bounds.right &&
+        point.y >= bounds.top &&
+        point.y <= bounds.bottom;
+      const speed = inside ? dragScrollSpeed(point.y, bounds.top, bounds.bottom) : 0;
+      if (speed === 0) return;
+      const dt = scrollStamp ? now - scrollStamp : 16;
+      scrollStamp = now;
+      const maxScroll = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      const next = dragScrollStep(scroller.scrollTop, maxScroll, speed, dt);
+      if (next !== scroller.scrollTop) {
+        scroller.scrollTop = next;
+        syncDrop(point.x, point.y);
+      }
+      if (finished || dragEpoch.current !== epoch) return;
+      scrollFrame = requestAnimationFrame(runScroll);
+    };
+    const armScroll = () => {
+      if (scrollFrame || finished || dragEpoch.current !== epoch) return;
+      scrollStamp = performance.now();
+      scrollFrame = requestAnimationFrame(runScroll);
+    };
     const detach = () => {
+      if (detached) return;
+      detached = true;
+      stopScroll();
       window.removeEventListener("pointermove", onPointerMove, true);
       window.removeEventListener("pointerup", onPointerUp, true);
       window.removeEventListener("pointercancel", onPointerCancel, true);
-      window.removeEventListener("dragover", onDragOver, true);
-      window.removeEventListener("drop", onDrop, true);
-      window.removeEventListener("dragend", onDragEnd, true);
+      window.removeEventListener("blur", onBlur);
     };
-    const end = (commit: boolean) => {
-      if (finished) return;
-      finished = true;
-      galleryFileDrag = false;
-      detach();
-      if (dragCleanup.current === cancel) dragCleanup.current = null;
-      const point = dragPointRef.current;
-      const overCanvas = canvasDropRef.current;
-      canvasDropRef.current = false;
-      const folder = dropRef.current.folder;
-      const index = dropRef.current.index;
-      dropRef.current = { folder: null, index: null };
+    const clearDragChrome = () => {
+      document.querySelectorAll<HTMLElement>(".shot-card").forEach((node) => {
+        if (!node.classList.contains("is-dragging") && !node.style.getPropertyValue("--drag-wash")) return;
+        node.style.removeProperty("--drag-wash");
+        node.style.opacity = "";
+      });
+    };
+    const dismissVisual = () => {
+      clearDragChrome();
       dragPointRef.current = null;
+      dragGhostRef.current = null;
       markKeyRef.current = "";
       folderHoldRef.current = null;
       setDragId(null);
       setDragPreview(null);
       setInsertMarks([]);
       setDropFolderId(null);
-      if (!commit) return;
+    };
+    const abort = () => {
+      if (dragEpoch.current !== epoch) return;
+      finished = true;
+      dragEpoch.current += 1;
+      detach();
+      dismissVisual();
+      dragCleanup.current = null;
+    };
+    const releaseReturn = () => {
+      if (dragEpoch.current !== epoch) return;
+      const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const ghost = dragGhostRef.current;
+      const point = dragPointRef.current;
+      const fromX = point ? point.x - grabRef.current.x : 0;
+      const fromY = point ? point.y - grabRef.current.y : 0;
+      dragEpoch.current += 1;
+      dismissVisual();
+      dragCleanup.current = null;
+      if (reduced || !ghost || !point) return;
+      const key = ++returnSeq.current;
+      const flight: DragReturn = { key, id, ids: group.slice(), ghost, fromX, fromY };
+      dragReturnsRef.current = [...dragReturnsRef.current, flight];
+      setDragReturns(dragReturnsRef.current);
+    };
+    const settle = (kind: "clear" | "spring") => {
+      if (dragEpoch.current !== epoch) return;
+      if (kind === "spring") {
+        releaseReturn();
+        return;
+      }
+      dragEpoch.current += 1;
+      dismissVisual();
+      dragCleanup.current = null;
+    };
+    const finish = (commit: boolean) => {
+      if (finished || dragEpoch.current !== epoch) return;
+      finished = true;
+      detach();
+      setInsertMarks([]);
+      setDropFolderId(null);
+      markKeyRef.current = "";
+      folderHoldRef.current = null;
+      const point = dragPointRef.current;
+      const overCanvas = canvasDropRef.current;
+      canvasDropRef.current = false;
+      const folder = dropRef.current.folder;
+      const index = dropRef.current.index;
+      dropRef.current = { folder: null, index: null };
+      if (!commit) {
+        settle("spring");
+        return;
+      }
       if (overCanvas && point) {
+        const mime = getPortfolioState().items.find((item) => item.id === id)?.mime ?? "";
+        if (!mime.startsWith("image/")) {
+          settle("spring");
+          return;
+        }
         window.dispatchEvent(new CustomEvent("komacho-canvas-drop", { detail: { imageId: id, clientX: point.x, clientY: point.y } }));
+        settle("clear");
         return;
       }
       if (folder && folder !== ALL_FOLDERS) {
-        void moveImagesToFolder(group, folder);
+        const verdict = folderDropVerdict(group, folder);
+        if (verdict === "parent") void moveImagesToFolder(group, folder);
+        if (verdict !== "move") {
+          settle("spring");
+          return;
+        }
+        dragCleanup.current = abort;
+        void moveImagesToFolder(group, folder).then(() => {
+          if (dragEpoch.current !== epoch) return;
+          const moved = getPortfolioState().items.some((item) => group.includes(item.id) && item.folderId === folder);
+          settle(moved ? "clear" : "spring");
+        });
         return;
       }
-      if (index === null) return;
-      const order = orderFromInsertion(placementsRef.current, group, id, index, directionRef.current === "desc");
-      if (!order) return;
-      setVisibleOrder(order);
-      void commitImageOrder();
+      if (index !== null) {
+        const order = orderFromInsertion(placementsRef.current, group, id, index, directionRef.current === "desc");
+        if (!order) {
+          settle("spring");
+          return;
+        }
+        if (!visibleOrderMatches(order)) {
+          setVisibleOrder(order);
+          if (!visibleOrderMatches(order)) {
+            settle("spring");
+            return;
+          }
+        }
+        dragCleanup.current = abort;
+        void commitImageOrder().then(() => {
+          if (dragEpoch.current !== epoch) return;
+          settle(visibleOrderMatches(order) ? "clear" : "spring");
+        });
+        return;
+      }
+      settle("spring");
     };
-    const onPointerMove = (pointer: PointerEvent) => moveTo(pointer.clientX, pointer.clientY);
+    const onPointerMove = (pointer: PointerEvent) => {
+      if (pointer.cancelable) pointer.preventDefault();
+      moveTo(pointer.clientX, pointer.clientY);
+      armScroll();
+    };
     const onPointerUp = (pointer: PointerEvent) => {
       const leftWindow =
         pointer.clientX < 0 ||
@@ -1317,7 +2170,7 @@ export function PortfolioScreen() {
         pointer.clientX > window.innerWidth ||
         pointer.clientY > window.innerHeight;
       if (leftWindow) {
-        end(false);
+        finish(false);
         return;
       }
       moveTo(pointer.clientX, pointer.clientY);
@@ -1325,36 +2178,15 @@ export function PortfolioScreen() {
       const overCanvas = Boolean(hit?.closest(".canvas-pane"));
       if (overCanvas && !canvasDropRef.current) window.dispatchEvent(new CustomEvent("komacho-canvas-drag-enter"));
       canvasDropRef.current = overCanvas;
-      end(true);
+      finish(true);
     };
-    const onPointerCancel = () => end(false);
-    const onDragOver = (event: globalThis.DragEvent) => {
-      event.preventDefault();
-      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
-      moveTo(event.clientX, event.clientY);
-    };
-    const onDrop = (event: globalThis.DragEvent) => {
-      event.preventDefault();
-      event.stopPropagation();
-      moveTo(event.clientX, event.clientY);
-      const hit = document.elementFromPoint(event.clientX, event.clientY);
-      const overCanvas = Boolean(hit?.closest(".canvas-pane"));
-      if (overCanvas && !canvasDropRef.current) window.dispatchEvent(new CustomEvent("komacho-canvas-drag-enter"));
-      canvasDropRef.current = overCanvas;
-      end(true);
-    };
-    const onDragEnd = () => end(false);
-    const cancel = () => end(false);
-    if (source === "native") {
-      window.addEventListener("dragover", onDragOver, true);
-      window.addEventListener("drop", onDrop, true);
-      window.addEventListener("dragend", onDragEnd, true);
-    } else {
-      window.addEventListener("pointermove", onPointerMove, true);
-      window.addEventListener("pointerup", onPointerUp, true);
-      window.addEventListener("pointercancel", onPointerCancel, true);
-    }
-    dragCleanup.current = cancel;
+    const onPointerCancel = () => finish(false);
+    const onBlur = () => finish(false);
+    window.addEventListener("pointermove", onPointerMove, true);
+    window.addEventListener("pointerup", onPointerUp, true);
+    window.addEventListener("pointercancel", onPointerCancel, true);
+    window.addEventListener("blur", onBlur);
+    dragCleanup.current = abort;
   };
 
   const onGalleryPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -1547,9 +2379,14 @@ export function PortfolioScreen() {
       const ids = selected.includes(prompt.imageId) && selected.length > 1 ? selected : [prompt.imageId];
       void unassignTagFromImages(ids, prompt.id);
     } else if (prompt.kind === "clear") {
-      void clearFilterTags(prompt.side);
+      const patch = prompt.side === "active" ? { activeTagIds: [] } : { hiddenTagIds: [] };
+      swapFilters(patch, () => clearFilterTags(prompt.side));
     } else {
-      void removeFilterTag(prompt.id, prompt.side);
+      const patch =
+        prompt.side === "active"
+          ? { activeTagIds: activeTagIds.filter((id) => id !== prompt.id) }
+          : { hiddenTagIds: hiddenTagIds.filter((id) => id !== prompt.id) };
+      swapFilters(patch, () => removeFilterTag(prompt.id, prompt.side));
     }
     setPrompt(null);
   };
@@ -1866,13 +2703,20 @@ export function PortfolioScreen() {
         ownerFolderId={ownerFolderId}
         dropFolderId={dropFolderId}
         dropCount={movingIds.length}
-        onSelect={(id) => void selectFolder(id)}
+        onSelect={(id) => {
+          if (id === folderId) return;
+          const view = folderViews[id] ?? DEFAULT_FOLDER_VIEW;
+          swapFilters({ folderId: id, direction: view.direction }, () => selectFolder(id));
+        }}
         onCreate={createInPlace}
         onRename={renameFolder}
         onDelete={(id) => void removeFolder(id)}
         onCopy={(id) => rememberFolderCopy(id)}
         onPaste={() => void pasteFolderCopy()}
-        onToggleHidden={(id) => void toggleFolderHidden(id)}
+        onToggleHidden={(id) => {
+          const hiddenFolderIdsNext = hiddenFolderIds.includes(id) ? hiddenFolderIds.filter((entry) => entry !== id) : [...hiddenFolderIds, id];
+          swapFilters({ hiddenFolderIds: hiddenFolderIdsNext }, () => toggleFolderHidden(id));
+        }}
         hiddenIds={hiddenFolderIds}
         copyReady={folderClip !== null}
         onReorder={(sourceId, beforeId, parentId) => void moveFolder(sourceId, beforeId, parentId)}
@@ -1904,10 +2748,10 @@ export function PortfolioScreen() {
                   <span className="tool-label">タブ</span>
                   {tabButtons}
                   <div className="seg" role="group" aria-label="並び順">
-                    <button type="button" className={direction === "asc" ? "is-on" : undefined} aria-pressed={direction === "asc"} disabled={phase !== "ready"} onClick={() => void setDirection("asc")}>
+                    <button type="button" className={direction === "asc" ? "is-on" : undefined} aria-pressed={direction === "asc"} disabled={phase !== "ready"} onClick={() => swapFilters({ direction: "asc" }, () => setDirection("asc"))}>
                       昇順
                     </button>
-                    <button type="button" className={direction === "desc" ? "is-on" : undefined} aria-pressed={direction === "desc"} disabled={phase !== "ready"} onClick={() => void setDirection("desc")}>
+                    <button type="button" className={direction === "desc" ? "is-on" : undefined} aria-pressed={direction === "desc"} disabled={phase !== "ready"} onClick={() => swapFilters({ direction: "desc" }, () => setDirection("desc"))}>
                       降順
                     </button>
                   </div>
@@ -1923,7 +2767,7 @@ export function PortfolioScreen() {
                   </button>
                 </div>
               )}
-              <Button variant="quiet" aria-pressed={favoritesOnly} disabled={!hasFavorite} onClick={() => void saveFavoritesOnly(!favoritesOnly)}>
+              <Button variant="quiet" aria-pressed={favoritesOnly} disabled={!hasFavorite} onClick={() => swapFilters({ favoritesOnly: !favoritesOnly }, () => saveFavoritesOnly(!favoritesOnly))}>
                 <Heart className="size-4" aria-hidden="true" fill={favoritesOnly ? "currentColor" : "none"} />
                 お気に入りのみ
               </Button>
@@ -1947,6 +2791,38 @@ export function PortfolioScreen() {
               </Button>
             </div>
             <div className="tool-row tool-row-sub">
+              {compact ? (
+              <span className="tilt-menu">
+                <Button variant="quiet" className={sensorHot ? "aux-btn is-sensor-live" : "aux-btn"} aria-pressed={sensorHot} aria-expanded={sensorStopAsk} aria-label={`傾き ${tiltLabel}`} onClick={onTiltMenu}>
+                  傾き
+                  <span className="tilt-state">{tiltLabel}</span>
+                </Button>
+                {sensorStopAsk && tiltBox ? (
+                  <div className="tilt-panel" role="dialog" aria-label="傾き・シェイクを停止しますか？" style={{ left: tiltBox.left, top: tiltBox.top }}>
+                    <p>傾き・シェイクを停止しますか？</p>
+                    <div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setWantedSensors({ tilt: false, shake: false });
+                          setSensorStopAsk(false);
+                        }}
+                      >
+                        停止する
+                      </button>
+                      <button type="button" onClick={() => setSensorStopAsk(false)}>
+                        キャンセル
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+              </span>
+              ) : null}
+              {compact ? null : (
+                <button type="button" className={cssFx ? "aux-btn css-fx-switch is-on" : "aux-btn css-fx-switch"} role="switch" aria-checked={cssFx} onClick={() => void saveCssFx(!cssFx)}>
+                  CSS演出
+                </button>
+              )}
               <BackupActions ref={backupRef} disabled={phase !== "ready"} viewer={compact} tab={activeLibraryTab()} />
               <Button
                 variant="quiet"
@@ -1983,8 +2859,8 @@ export function PortfolioScreen() {
                   }}
                 />
               ) : null}
-              <Button variant="quiet" className="aux-btn phone-shelved" onClick={() => setStorageOpen(true)}>
-                容量
+              <Button variant="quiet" className="aux-btn" onClick={() => setStorageOpen(true)}>
+                詳細
               </Button>
               <span ref={slideshowAnchorRef} className="slideshow-anchor">
               <Button
@@ -2007,12 +2883,7 @@ export function PortfolioScreen() {
                 variant="quiet"
                 className="aux-btn"
                 disabled={phase !== "ready" || visible.length < 2}
-                onClick={() => {
-                  const shuffled = shuffleIds(visible.map((item) => item.id));
-                  const stored = direction === "desc" ? shuffled.slice().reverse() : shuffled;
-                  setVisibleOrder(stored, compact);
-                  void commitImageOrder(compact);
-                }}
+                onClick={() => beginShuffleRef.current()}
               >
                 <Shuffle className="size-4" aria-hidden="true" />
                 シャッフル
@@ -2024,8 +2895,10 @@ export function PortfolioScreen() {
                 onClick={() => {
                   const sorted = addedDateOrder(visible);
                   const stored = direction === "desc" ? sorted.slice().reverse() : sorted;
-                  setVisibleOrder(stored, compact);
-                  void commitImageOrder(compact);
+                  playListSwapRef.current(sorted, () => {
+                    setVisibleOrder(stored, compact);
+                    void commitImageOrder(compact);
+                  }, compact);
                 }}
               >
                 日付順でソート
@@ -2095,7 +2968,16 @@ export function PortfolioScreen() {
               tagById={tagById}
               viewer={compact}
               match={tagMatch}
-              onMatch={(next) => void setTagMatch(next)}
+              onMatch={(next) => swapFilters({ tagMatch: next }, () => setTagMatch(next))}
+              onPlace={(id) =>
+                swapFilters(
+                  {
+                    activeTagIds: activeTagIds.includes(id) ? activeTagIds : [...activeTagIds, id],
+                    hiddenTagIds: hiddenTagIds.filter((entry) => entry !== id),
+                  },
+                  () => placeFilterTag(id, "active"),
+                )
+              }
               onPrompt={(id, rect) => setPrompt({ kind: "filter", id, side: "active", ...popAt(rect) })}
               onClear={(rect) => setPrompt({ kind: "clear", side: "active", ...popAt(rect) })}
             />
@@ -2105,6 +2987,15 @@ export function PortfolioScreen() {
               ids={hiddenTagIds}
               tagById={tagById}
               viewer={compact}
+              onPlace={(id) =>
+                swapFilters(
+                  {
+                    hiddenTagIds: hiddenTagIds.includes(id) ? hiddenTagIds : [...hiddenTagIds, id],
+                    activeTagIds: activeTagIds.filter((entry) => entry !== id),
+                  },
+                  () => placeFilterTag(id, "hidden"),
+                )
+              }
               onPrompt={(id, rect) => setPrompt({ kind: "filter", id, side: "hidden", ...popAt(rect) })}
               onClear={(rect) => setPrompt({ kind: "clear", side: "hidden", ...popAt(rect) })}
             />
@@ -2131,11 +3022,12 @@ export function PortfolioScreen() {
                   box={placements.find((box) => box.id === item.id) ?? { id: item.id, x: 0, y: 0, w: 0, h: 0 }}
                   tags={listedTags.filter((tag) => item.tagIds.includes(tag.id))}
                   dragging={movingIds.includes(item.id)}
+                  settling={returningIds.has(item.id) && !movingIds.includes(item.id)}
                   insertEdge={movingIds.includes(item.id) ? null : (insertMarks.find((mark) => mark.id === item.id)?.edge ?? null)}
                   onOpen={openAt}
+                  zoomSource={zoomLaunch?.id === item.id}
                   onInk={openInk}
                   onDragStart={onCardDragStart}
-                  onExternalDrag={onExternalDrag}
                   flash={flashId === item.id}
                   fading={flashId === item.id && flashFade}
                   origin={showOrigin ? folderPath(folders, item.folderId) : ""}
@@ -2197,8 +3089,26 @@ export function PortfolioScreen() {
         slide={compact ? edgeSlide?.tag ?? null : null}
         width={tagW}
         onToggle={toggleTag}
-        onSelect={(id) => void selectTag(id)}
-        onHide={(id) => void hideTag(id)}
+        onSelect={(id) => {
+          const turningOff = activeTagIds.includes(id);
+          swapFilters(
+            {
+              activeTagIds: turningOff ? activeTagIds.filter((entry) => entry !== id) : [...activeTagIds, id],
+              hiddenTagIds: turningOff ? hiddenTagIds : hiddenTagIds.filter((entry) => entry !== id),
+            },
+            () => selectTag(id),
+          );
+        }}
+        onHide={(id) => {
+          const turningOff = hiddenTagIds.includes(id);
+          swapFilters(
+            {
+              hiddenTagIds: turningOff ? hiddenTagIds.filter((entry) => entry !== id) : [...hiddenTagIds, id],
+              activeTagIds: turningOff ? activeTagIds : activeTagIds.filter((entry) => entry !== id),
+            },
+            () => hideTag(id),
+          );
+        }}
         onCreate={(name) => void createTag(name)}
         onCreateFolder={(name) => void createTagFolder(name)}
         onToggleFolder={(id) => void toggleTagFolder(id)}
@@ -2323,10 +3233,58 @@ export function PortfolioScreen() {
         />
       ) : null}
       {dragPreview ? (
-        <div ref={previewRef} className="drag-preview" style={{ width: dragPreview.w, height: dragPreview.h }} aria-hidden="true">
-          {dragPreview.src ? <img src={dragPreview.src} alt="" draggable={false} /> : null}
+        <div key={dragFloatKey} ref={previewRef} className="drag-preview" style={{ width: dragPreview.w, height: dragPreview.h }} data-drag-float="" aria-hidden="true">
+          <div className="drag-frame shot-frame">
+            <div
+              className="shot-contact"
+              style={
+                {
+                  "--thumb-rx": dragPreview.rx,
+                  "--thumb-ry": dragPreview.ry,
+                  "--thumb-sx": dragPreview.sx,
+                  "--thumb-sy": dragPreview.sy,
+                  "--thumb-so": dragPreview.so,
+                  "--thumb-st": dragPreview.st,
+                  transition: "none",
+                } as CSSProperties
+              }
+            >
+              {dragPreview.src ? <img src={dragPreview.src} alt="" draggable={false} /> : null}
+              <span className="shot-sheen" style={{ transition: "none" }} />
+            </div>
+          </div>
         </div>
       ) : null}
+      {dragReturns.map((item) => (
+        <div
+          key={item.key}
+          ref={binderFor(item.key)}
+          className="drag-preview"
+          style={{ width: item.ghost.w, height: item.ghost.h, opacity: DRAG_CLONE_OPACITY, pointerEvents: "none" }}
+          data-drag-return={item.key}
+          aria-hidden="true"
+        >
+          <div className="drag-frame shot-frame">
+            <div
+              className="shot-contact"
+              style={
+                {
+                  "--thumb-rx": item.ghost.rx,
+                  "--thumb-ry": item.ghost.ry,
+                  "--thumb-sx": item.ghost.sx,
+                  "--thumb-sy": item.ghost.sy,
+                  "--thumb-so": item.ghost.so,
+                  "--thumb-st": item.ghost.st,
+                  transition: "none",
+                } as CSSProperties
+              }
+            >
+              {item.ghost.src ? <img src={item.ghost.src} alt="" draggable={false} /> : null}
+              <span className="shot-sheen" style={{ transition: "none" }} />
+            </div>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -2339,6 +3297,7 @@ function TagFilterPane({
   viewer,
   match = "all",
   onMatch,
+  onPlace,
   onPrompt,
   onClear,
 }: {
@@ -2349,6 +3308,7 @@ function TagFilterPane({
   viewer: boolean;
   match?: "all" | "any";
   onMatch?: (match: "all" | "any") => void;
+  onPlace: (id: string) => void;
   onPrompt: (id: string, rect: DOMRect) => void;
   onClear: (rect: DOMRect) => void;
 }) {
@@ -2375,7 +3335,7 @@ function TagFilterPane({
         const id = event.dataTransfer.getData(TAG_DRAG) || currentTagDrag();
         event.preventDefault();
         setHot(false);
-        if (id) void placeFilterTag(id, side);
+        if (id) onPlace(id);
       }}
     >
       <div className="tag-pane-head">

@@ -1,4 +1,7 @@
 import { ALL_FOLDERS, DEFAULT_FOLDER_VIEW, SUPPORTED_MIMES, TAG_COLORS, type DisplayScale, type Folder, type FolderView, type ImageMeta, type ImageSource, type SupportedMime, type Tag, type TagFolder } from "./types.ts";
+import { normalizePuruMarkers } from "./purupuru.ts";
+import { normalizeVectorMarkers } from "./vector-marker.ts";
+import { normalizeImagePlay } from "./image-play.ts";
 
 export type ImageCandidate = {
   name: string;
@@ -74,7 +77,7 @@ export function importNotice(stats: ImportStats): string | null {
   const parts: string[] = [];
   if (stats.added > 0) parts.push(`${stats.added}枚は追加しました。`);
   if (stats.quota) {
-    parts.push("保存容量が不足している可能性があります。「容量」で使用量を確認し、不要な画像を削除してから、もう一度追加してください。画像は自動では削除しません。");
+    parts.push("保存容量が不足している可能性があります。「詳細」で使用量を確認し、不要な画像を削除してから、もう一度追加してください。画像は自動では削除しません。");
   } else if (stats.failedSave > 0) {
     parts.push(`${stats.failedSave}枚を保存できませんでした。`);
   }
@@ -94,13 +97,13 @@ export function storageErrorMessage(error: unknown, action: "save" | "delete" | 
       ? error.name
       : "";
   if (name === "QuotaExceededError") {
-    return "保存容量が不足しています。「容量」で使用量を確認し、不要な画像を削除してから、もう一度追加してください。画像は自動では削除しません。";
+    return "保存容量が不足しています。「詳細」で使用量を確認し、不要な画像を削除してから、もう一度追加してください。画像は自動では削除しません。";
   }
   if (action === "delete") return "削除を保存できませんでした。画像はそのまま残しています。";
   if (action === "open") {
     return "画像ライブラリを開けませんでした。このブラウザでは保存機能が使えないことがあります。";
   }
-  return "保存に失敗しました。容量が足りない可能性があります。「容量」で使用量を確認し、不要な画像を削除してからもう一度試してください。画像は自動では削除しません。";
+  return "保存に失敗しました。容量が足りない可能性があります。「詳細」で使用量を確認し、不要な画像を削除してからもう一度試してください。画像は自動では削除しません。";
 }
 
 export function formatCount(count: number): string {
@@ -135,6 +138,9 @@ export function normalizeMeta(raw: unknown): ImageMeta | null {
   }
   const source: ImageSource =
     row.source === "clipboard" || row.source === "capture" ? row.source : "file";
+  const puruMarkers = normalizePuruMarkers(row.puru);
+  const vectorMarkers = normalizeVectorMarkers(row.vectors);
+  const play = normalizeImagePlay(row.play);
   return {
     id: row.id,
     name: typeof row.name === "string" && row.name ? row.name : "無題",
@@ -154,6 +160,9 @@ export function normalizeMeta(raw: unknown): ImageMeta | null {
     animated: row.animated === true,
     memo: normalizeMemo(row.memo),
     inkVisible: row.inkVisible === false ? false : true,
+    ...(puruMarkers !== null ? { puru: { markers: puruMarkers } } : {}),
+    ...(vectorMarkers !== null ? { vectors: { markers: vectorMarkers } } : {}),
+    ...(play ? { play } : {}),
   };
 }
 
@@ -394,8 +403,11 @@ export function folderChildren(folders: readonly Folder[], parentId: string | nu
 
 export function flattenFolders(folders: readonly Folder[]): { folder: Folder; depth: number }[] {
   const out: { folder: Folder; depth: number }[] = [];
+  const seen = new Set<string>();
   const walk = (parentId: string | null, depth: number) => {
     for (const folder of folderChildren(folders, parentId)) {
+      if (seen.has(folder.id)) continue;
+      seen.add(folder.id);
       out.push({ folder, depth });
       walk(folder.id, depth + 1);
     }
@@ -454,8 +466,11 @@ export function folderWouldCycle(folders: readonly Folder[], sourceId: string, p
 
 export function descendantFolderIds(folders: readonly Folder[], rootId: string): string[] {
   const out: string[] = [];
+  const seen = new Set<string>([rootId]);
   const walk = (id: string) => {
     for (const child of folderChildren(folders, id)) {
+      if (seen.has(child.id)) continue;
+      seen.add(child.id);
       out.push(child.id);
       walk(child.id);
     }

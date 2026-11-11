@@ -1,7 +1,9 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { FlowSaver } from "@/components/portfolio/flow-saver";
 import { Button } from "@/components/ui/button";
 import { readPixels } from "@/lib/portfolio/db";
+import { flowRowOrders, type FlowRows } from "@/lib/portfolio/flow-saver";
 import {
   advanceDeck,
   clampSlideSeconds,
@@ -14,6 +16,31 @@ import { notify } from "@/lib/portfolio/store";
 import type { ImageMeta } from "@/lib/portfolio/types";
 
 const EMPTY_NOTE = "表示中の画像がないため、スライドショーを開始できません。";
+
+type SlideshowMode = "slides" | FlowRows;
+
+const VIEW_MODES: { id: SlideshowMode; label: string }[] = [
+  { id: "slides", label: "通常のスライドショー" },
+  { id: 1, label: "連続流動型（1段）" },
+  { id: 2, label: "連続流動型（2段）" },
+  { id: 3, label: "連続流動型（3段）" },
+];
+
+type SlidePlay = {
+  kind: "slides";
+  items: ImageMeta[];
+  order: SlideshowOrder;
+  seconds: number;
+  showClock: boolean;
+  zoom: boolean;
+};
+
+type FlowPlay = {
+  kind: "flow";
+  items: ImageMeta[];
+  rows: FlowRows;
+  orders: number[][];
+};
 
 export function Slideshow({
   open,
@@ -31,21 +58,17 @@ export function Slideshow({
   anchor?: HTMLElement | null;
 }) {
   const [order, setOrder] = useState<SlideshowOrder>("sequence");
+  const [mode, setMode] = useState<SlideshowMode>("slides");
   const [seconds, setSeconds] = useState(5);
   const [showClock, setShowClock] = useState(false);
   const [zoom, setZoom] = useState(true);
-  const [play, setPlay] = useState<{
-    items: ImageMeta[];
-    order: SlideshowOrder;
-    seconds: number;
-    showClock: boolean;
-    zoom: boolean;
-  } | null>(null);
+  const [play, setPlay] = useState<SlidePlay | FlowPlay | null>(null);
 
   useEffect(() => {
     if (open) return;
     setPlay(null);
     setOrder("sequence");
+    setMode("slides");
     setSeconds(5);
     setShowClock(false);
     setZoom(true);
@@ -56,6 +79,14 @@ export function Slideshow({
   if (play) {
     if (dock && !container) return null;
     const host = container ?? document.body;
+    if (play.kind === "flow") {
+      return createPortal(
+        <SlideshowFrame docked={dock} mode={`flow-${play.rows}`} onClose={() => onOpenChange(false)}>
+          <FlowSaver items={play.items} rows={play.rows} orders={play.orders} />
+        </SlideshowFrame>,
+        host,
+      );
+    }
     return createPortal(
       <SlideshowPlayer
         items={play.items}
@@ -77,17 +108,23 @@ export function Slideshow({
       onOpenChange(false);
       return;
     }
-    setPlay({ items: list, order, seconds: clampSlideSeconds(seconds), showClock, zoom });
+    if (mode === "slides") {
+      setPlay({ kind: "slides", items: list, order, seconds: clampSlideSeconds(seconds), showClock, zoom });
+      return;
+    }
+    setPlay({ kind: "flow", items: list, rows: mode, orders: flowRowOrders(list.length, mode) });
   };
 
   return createPortal(
     <SlideshowSetup
       anchor={anchor}
       order={order}
+      mode={mode}
       seconds={seconds}
       showClock={showClock}
       zoom={zoom}
       onOrder={setOrder}
+      onMode={setMode}
       onSeconds={setSeconds}
       onShowClock={setShowClock}
       onZoom={setZoom}
@@ -101,10 +138,12 @@ export function Slideshow({
 function SlideshowSetup({
   anchor,
   order,
+  mode,
   seconds,
   showClock,
   zoom,
   onOrder,
+  onMode,
   onSeconds,
   onShowClock,
   onZoom,
@@ -113,10 +152,12 @@ function SlideshowSetup({
 }: {
   anchor: HTMLElement | null;
   order: SlideshowOrder;
+  mode: SlideshowMode;
   seconds: number;
   showClock: boolean;
   zoom: boolean;
   onOrder: (order: SlideshowOrder) => void;
+  onMode: (mode: SlideshowMode) => void;
   onSeconds: (seconds: number) => void;
   onShowClock: (shown: boolean) => void;
   onZoom: (zoom: boolean) => void;
@@ -149,7 +190,7 @@ function SlideshowSetup({
     place();
     window.addEventListener("resize", place);
     return () => window.removeEventListener("resize", place);
-  }, [anchor]);
+  }, [anchor, mode]);
 
   useLayoutEffect(() => {
     if (!secondsOpen) return;
@@ -188,6 +229,18 @@ function SlideshowSetup({
           </h2>
           <p className="m-0 mt-1 text-sm text-ink-muted">いま一覧に出ている画像を再生します。</p>
         </div>
+        <div>
+          <p className="m-0 text-sm">表示方式</p>
+          <div className="slideshow-choices is-modes" role="group" aria-label="表示方式">
+            {VIEW_MODES.map((entry) => (
+              <Button key={String(entry.id)} variant={mode === entry.id ? "primary" : "quiet"} aria-pressed={mode === entry.id} onClick={() => onMode(entry.id)}>
+                {entry.label}
+              </Button>
+            ))}
+          </div>
+        </div>
+        {mode === "slides" ? (
+          <>
         <div>
           <p className="m-0 text-sm">画像の順番</p>
           <div className="slideshow-choices" role="group" aria-label="画像の順番">
@@ -246,6 +299,8 @@ function SlideshowSetup({
           <input type="checkbox" checked={showClock} onChange={(event) => onShowClock(event.target.checked)} />
           切り替えまでの秒数を表示
         </label>
+          </>
+        ) : null}
         <div className="slideshow-actions">
           <Button variant="quiet" onClick={onClose}>
             キャンセル
@@ -253,6 +308,64 @@ function SlideshowSetup({
           <Button onClick={onStart}>開始</Button>
         </div>
       </div>
+    </div>
+  );
+}
+
+function SlideshowFrame({
+  docked,
+  mode,
+  onClose,
+  children,
+}: {
+  docked: boolean;
+  mode: string;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const dockedRef = useRef(docked);
+  dockedRef.current = docked;
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (dockedRef.current) {
+        const target = event.target;
+        if (target instanceof Node && document.querySelector(".canvas-pane")?.contains(target)) return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.key === "Escape") onCloseRef.current();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, []);
+
+  useEffect(() => {
+    if (docked) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [docked]);
+
+  return (
+    <div
+      className="slideshow-stage"
+      data-slideshow-mode={mode}
+      role="button"
+      tabIndex={0}
+      aria-label="スライドショーを終了"
+      onPointerDown={(event) => event.stopPropagation()}
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onClose();
+      }}
+    >
+      {children}
     </div>
   );
 }
@@ -274,10 +387,6 @@ function SlideshowPlayer({
   docked?: boolean;
   onClose: () => void;
 }) {
-  const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
-  const dockedRef = useRef(docked);
-  dockedRef.current = docked;
   const [layers, setLayers] = useState<Array<{ token: number; url: string; on: boolean }>>([]);
   const [remaining, setRemaining] = useState(seconds);
   const tokenRef = useRef(0);
@@ -357,34 +466,13 @@ function SlideshowPlayer({
 
     void show(cursor.deck[cursor.at] ?? 0);
 
-    const onKey = (event: KeyboardEvent) => {
-      if (dockedRef.current) {
-        const target = event.target;
-        if (target instanceof Node && document.querySelector(".canvas-pane")?.contains(target)) return;
-      }
-      event.preventDefault();
-      event.stopPropagation();
-      if (event.key === "Escape") onCloseRef.current();
-    };
-    window.addEventListener("keydown", onKey, true);
-
     return () => {
       alive = false;
       window.clearTimeout(timer);
       window.cancelAnimationFrame(reveal);
-      window.removeEventListener("keydown", onKey, true);
       for (const url of urls.values()) URL.revokeObjectURL(url);
     };
   }, [items, order, seconds]);
-
-  useEffect(() => {
-    if (docked) return;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    return () => {
-      document.body.style.overflow = previousOverflow;
-    };
-  }, [docked]);
 
   useEffect(() => {
     if (!showClock) return;
@@ -403,18 +491,7 @@ function SlideshowPlayer({
   }, [showClock]);
 
   return (
-    <div
-      className="slideshow-stage"
-      role="button"
-      tabIndex={0}
-      aria-label="スライドショーを終了"
-      onPointerDown={(event) => event.stopPropagation()}
-      onClick={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        onClose();
-      }}
-    >
+    <SlideshowFrame docked={docked} mode="slides" onClose={onClose}>
       {layers.map((layer) => (
         <div
           key={layer.token}
@@ -430,7 +507,7 @@ function SlideshowPlayer({
           {remaining} 秒
         </p>
       ) : null}
-    </div>
+    </SlideshowFrame>
   );
 }
 

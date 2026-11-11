@@ -15,6 +15,7 @@ import {
   INITIAL_FOLDER_NAME,
   libraryConnectionEpoch,
   libraryDbName,
+  LIBRARY_OPEN_TIMEOUT,
   librarySlotPlan,
   type LibraryTab,
   readFolderCopySource,
@@ -71,7 +72,10 @@ import { emptyLibraryBackup } from "./backup.ts";
 import { ImagePrepareError, prepareImage } from "./prepare.ts";
 import { forgetAllThumbs, forgetThumb } from "./thumbs.ts";
 import { clearInkHistories } from "./ink.ts";
-import { ALL_FOLDERS, DEFAULT_FOLDER_VIEW, TAG_COLORS, type DisplayScale, type Folder, type FolderView, type ImageMeta, type ImageSource, type Tag, type TagFolder } from "./types.ts";
+import { ALL_FOLDERS, DEFAULT_FOLDER_VIEW, TAG_COLORS, type DisplayScale, type Folder, type FolderView, type ImageMeta, type ImagePlay, type ImageSource, type Tag, type TagFolder } from "./types.ts";
+import { normalizeImagePlay } from "./image-play.ts";
+import { normalizePuruMarkers, type PuruMarker } from "./purupuru.ts";
+import { normalizeVectorMarkers, type VectorMarker } from "./vector-marker.ts";
 
 export type PendingAdd = {
   files: File[];
@@ -101,6 +105,8 @@ export type PortfolioState = {
   folderPane: number;
   folderOpen: boolean;
   favoritesOnly: boolean;
+  /** Decorative CSS motion. Missing or 0 stays off. */
+  cssFx: boolean;
   tags: Tag[];
   tagFolders: TagFolder[];
   activeTagIds: string[];
@@ -134,6 +140,7 @@ const SERVER_SNAPSHOT: PortfolioState = {
   folderPane: 360,
   folderOpen: true,
   favoritesOnly: false,
+  cssFx: false,
   tags: [],
   tagFolders: [],
   activeTagIds: [],
@@ -227,6 +234,13 @@ export function viewerLocked(): boolean {
   return viewerLock;
 }
 
+function bootFailure(error: unknown): string {
+  if (error instanceof Error && error.message === LIBRARY_OPEN_TIMEOUT) {
+    return "画像ライブラリを開けませんでした。ほかの画面がこの保存先をつかんでいる可能性があります。画像やフォルダは消していません。その画面を閉じてから、「もう一度開く」を押してください。";
+  }
+  return storageErrorMessage(error, "open");
+}
+
 function isQuota(error: unknown): boolean {
   return (
     (typeof DOMException !== "undefined" &&
@@ -238,13 +252,14 @@ function isQuota(error: unknown): boolean {
 
 async function loadLibraryIntoState(epoch: number): Promise<void> {
   clearInkHistories();
-  const [items, folder, width, open, pane, favoritesOnly, tags, tag, tagHidden, tagMatch, tagOpen, tagWidth, tagFolders, folderHidden, inkIdList, canvasSplit] = await Promise.all([
+  const [items, folder, width, open, pane, favoritesOnly, cssFx, tags, tag, tagHidden, tagMatch, tagOpen, tagWidth, tagFolders, folderHidden, inkIdList, canvasSplit] = await Promise.all([
     listMeta(),
     readKvString("folder", ALL_FOLDERS),
     readKv("folderWidth", 240),
     readKv("folderOpen", 1),
     readKv("folderPane", 360),
     readKv("favoritesOnly", 0),
+    readKv("cssFx", 0),
     listTags(),
     readKvString("tag", ""),
     readKvString("tagHidden", ""),
@@ -310,6 +325,7 @@ async function loadLibraryIntoState(epoch: number): Promise<void> {
     folderPane: Math.min(720, Math.max(140, pane || 360)),
     folderOpen: open !== 0,
     favoritesOnly: favoritesOnly === 1,
+    cssFx: cssFx === 1,
     tags: filed,
     tagFolders,
     activeTagIds,
@@ -340,7 +356,7 @@ export function bootstrap(): Promise<void> {
         forceState((current) => ({
           ...current,
           phase: "unavailable",
-          bootError: storageErrorMessage(error, "open"),
+          bootError: bootFailure(error),
         }));
       })
       .finally(() => {
@@ -398,6 +414,7 @@ async function applyRetarget(ticket: number): Promise<void> {
       columns: DEFAULT_FOLDER_VIEW.columns,
       direction: DEFAULT_FOLDER_VIEW.direction,
       favoritesOnly: false,
+      cssFx: false,
       tags: [],
       tagFolders: [],
       activeTagIds: [],
@@ -424,7 +441,7 @@ async function applyRetarget(ticket: number): Promise<void> {
     forceState((current) => ({
       ...current,
       phase: "unavailable",
-      bootError: storageErrorMessage(error, "open"),
+      bootError: bootFailure(error),
       libraryEpoch: ticket,
     }));
   } finally {
@@ -740,6 +757,73 @@ export async function setImageMemo(id: string, memo: string): Promise<void> {
   } catch (error) {
     setState((current) => ({ ...current, items: previous }));
     pushNotice(storageErrorMessage(error, "save"));
+  }
+}
+
+/** Writes this image's marker layout. Other images are left alone. A failed write keeps the previous layout. */
+export async function saveImagePuru(id: string, markers: readonly PuruMarker[]): Promise<boolean> {
+  if (!userWritesOpen()) return false;
+  const item = state.items.find((entry) => entry.id === id);
+  if (!item) return false;
+  const saved = normalizePuruMarkers({ markers }) ?? [];
+  const next = { ...item, puru: { markers: saved } };
+  const previous = state.items;
+  setState((current) => ({
+    ...current,
+    items: current.items.map((entry) => (entry.id === id ? next : entry)),
+  }));
+  try {
+    await putMeta(next);
+    return true;
+  } catch (error) {
+    setState((current) => ({ ...current, items: previous }));
+    pushNotice(storageErrorMessage(error, "save"));
+    return false;
+  }
+}
+
+/** Writes this image's vector markers. Puru markers and the picture itself stay as they are. */
+export async function saveImageVectors(id: string, markers: readonly VectorMarker[]): Promise<boolean> {
+  if (!userWritesOpen()) return false;
+  const item = state.items.find((entry) => entry.id === id);
+  if (!item) return false;
+  const saved = normalizeVectorMarkers({ markers }) ?? [];
+  const next = { ...item, vectors: { markers: saved } };
+  const previous = state.items;
+  setState((current) => ({
+    ...current,
+    items: current.items.map((entry) => (entry.id === id ? next : entry)),
+  }));
+  try {
+    await putMeta(next);
+    return true;
+  } catch (error) {
+    setState((current) => ({ ...current, items: previous }));
+    pushNotice(storageErrorMessage(error, "save"));
+    return false;
+  }
+}
+
+/** Writes this image's animation and voice preset. Other images, and this image's markers, stay as they are. */
+export async function saveImagePlay(id: string, play: ImagePlay): Promise<boolean> {
+  if (!userWritesOpen()) return false;
+  const item = state.items.find((entry) => entry.id === id);
+  if (!item) return false;
+  const saved = normalizeImagePlay(play);
+  if (!saved) return false;
+  const next = { ...item, play: saved };
+  const previous = state.items;
+  setState((current) => ({
+    ...current,
+    items: current.items.map((entry) => (entry.id === id ? next : entry)),
+  }));
+  try {
+    await putMeta(next);
+    return true;
+  } catch (error) {
+    setState((current) => ({ ...current, items: previous }));
+    pushNotice(storageErrorMessage(error, "save"));
+    return false;
   }
 }
 
@@ -1892,6 +1976,17 @@ export async function saveFavoritesOnly(on: boolean): Promise<void> {
     await writeKv("favoritesOnly", on ? 1 : 0);
   } catch (error) {
     setState((current) => ({ ...current, favoritesOnly: !on }));
+    pushNotice(storageErrorMessage(error, "save"));
+  }
+}
+
+export async function saveCssFx(on: boolean): Promise<void> {
+  if (!userWritesOpen()) return;
+  setState((current) => ({ ...current, cssFx: on }));
+  try {
+    await writeKv("cssFx", on ? 1 : 0);
+  } catch (error) {
+    setState((current) => ({ ...current, cssFx: !on }));
     pushNotice(storageErrorMessage(error, "save"));
   }
 }

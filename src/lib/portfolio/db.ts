@@ -276,6 +276,11 @@ function upgradeLibrary(db: IDBDatabase): void {
   }
 }
 
+const LIBRARY_OPEN_TIMEOUT_MS = 8000;
+
+/** `indexedDB.open` produced neither success nor error. A blocked delete can do this. Data is left untouched. */
+export const LIBRARY_OPEN_TIMEOUT = "indexedDB open timed out";
+
 function openNamed(name: string, track: boolean): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     let request: IDBOpenDBRequest;
@@ -286,22 +291,45 @@ function openNamed(name: string, track: boolean): Promise<IDBDatabase> {
       return;
     }
 
+    let settled = false;
+    const finish = (run: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      run();
+    };
+    const timer = setTimeout(() => {
+      finish(() => reject(new Error(LIBRARY_OPEN_TIMEOUT)));
+    }, LIBRARY_OPEN_TIMEOUT_MS);
+
     let created = false;
     request.onupgradeneeded = (event) => {
       created = (event as IDBVersionChangeEvent).oldVersion === 0;
-      upgradeLibrary(request.result);
+      try {
+        upgradeLibrary(request.result);
+      } catch (error) {
+        finish(() => reject(error));
+      }
     };
     request.onsuccess = () => {
       const db = request.result;
+      if (settled) {
+        try {
+          db.close();
+        } catch {
+          /* the open lost the race with the timeout */
+        }
+        return;
+      }
       openedFresh.set(db, created);
       db.onversionchange = () => {
         db.close();
         if (track) dbPromise = null;
       };
-      resolve(db);
+      finish(() => resolve(db));
     };
-    request.onerror = () => reject(request.error ?? new Error("indexedDB open failed"));
-    request.onblocked = () => reject(new Error("indexedDB blocked"));
+    request.onerror = () => finish(() => reject(request.error ?? new Error("indexedDB open failed")));
+    request.onblocked = () => finish(() => reject(new Error("indexedDB blocked")));
   });
 }
 
@@ -448,11 +476,20 @@ export function listInkIds(): Promise<string[]> {
         const req = tx.objectStore("imageInk").openCursor();
         const ids: string[] = [];
         req.onsuccess = () => {
-          const cursor = req.result;
-          if (!cursor) return;
-          const row = cursor.value as InkRow;
-          if (row && typeof row.id === "string" && !isCanvasInkId(row.id) && row.png instanceof Blob && row.png.size > 0) ids.push(row.id);
-          cursor.continue();
+          try {
+            const cursor = req.result;
+            if (!cursor) return;
+            const row = cursor.value as InkRow;
+            if (row && typeof row.id === "string" && !isCanvasInkId(row.id) && row.png instanceof Blob && row.png.size > 0) ids.push(row.id);
+            cursor.continue();
+          } catch (error) {
+            reject(error);
+            try {
+              tx.abort();
+            } catch {
+              /* the transaction is already finishing */
+            }
+          }
         };
         tx.oncomplete = () => resolve(ids);
         tx.onerror = () => reject(tx.error ?? new Error("ink list failed"));
@@ -482,6 +519,19 @@ export function listPrefixedInkIds(prefix: string): Promise<string[]> {
   );
 }
 
+function failRead(reject: (error: unknown) => void, error: unknown, fallback: string): void {
+  reject(error ?? new Error(fallback));
+}
+
+/** A throw inside an IndexedDB success callback must reject. Otherwise the boot promise never settles. */
+function readResult<T>(fallback: string, run: () => T, resolve: (value: T) => void, reject: (error: unknown) => void): void {
+  try {
+    resolve(run());
+  } catch (error) {
+    failRead(reject, error, fallback);
+  }
+}
+
 export function listMeta(): Promise<ImageMeta[]> {
   return getDb().then(
     (db) =>
@@ -489,12 +539,19 @@ export function listMeta(): Promise<ImageMeta[]> {
         const tx = db.transaction("imageMeta", "readonly");
         const req = tx.objectStore("imageMeta").getAll();
         req.onsuccess = () => {
-          const rows = ((req.result as unknown[]) ?? [])
-            .map((row) => normalizeMeta(row))
-            .filter((row): row is ImageMeta => row !== null);
-          resolve(sortByOrder(rows));
+          readResult(
+            "list failed",
+            () => {
+              const rows = ((req.result as unknown[]) ?? [])
+                .map((row) => normalizeMeta(row))
+                .filter((row): row is ImageMeta => row !== null);
+              return sortByOrder(rows);
+            },
+            resolve,
+            reject,
+          );
         };
-        req.onerror = () => reject(req.error ?? new Error("list failed"));
+        req.onerror = () => failRead(reject, req.error, "list failed");
       }),
   );
 }
@@ -540,10 +597,17 @@ export function readKv(key: string, fallback: number): Promise<number> {
         const tx = db.transaction("kv", "readonly");
         const req = tx.objectStore("kv").get(key);
         req.onsuccess = () => {
-          const value = (req.result as KvRow | undefined)?.value;
-          resolve(typeof value === "number" ? value : fallback);
+          readResult(
+            "setting read failed",
+            () => {
+              const value = (req.result as KvRow | undefined)?.value;
+              return typeof value === "number" ? value : fallback;
+            },
+            resolve,
+            reject,
+          );
         };
-        req.onerror = () => reject(req.error ?? new Error("setting read failed"));
+        req.onerror = () => failRead(reject, req.error, "setting read failed");
       }),
   );
 }
@@ -559,10 +623,17 @@ export function readKvString(key: string, fallback: string): Promise<string> {
         const tx = db.transaction("kv", "readonly");
         const req = tx.objectStore("kv").get(key);
         req.onsuccess = () => {
-          const value = (req.result as KvRow | undefined)?.value;
-          resolve(typeof value === "string" && value ? value : fallback);
+          readResult(
+            "setting read failed",
+            () => {
+              const value = (req.result as KvRow | undefined)?.value;
+              return typeof value === "string" && value ? value : fallback;
+            },
+            resolve,
+            reject,
+          );
         };
-        req.onerror = () => reject(req.error ?? new Error("setting read failed"));
+        req.onerror = () => failRead(reject, req.error, "setting read failed");
       }),
   );
 }
@@ -574,9 +645,9 @@ export function listFolders(): Promise<Folder[]> {
         const tx = db.transaction("folders", "readonly");
         const req = tx.objectStore("folders").getAll();
         req.onsuccess = () => {
-          resolve(normalizeFolders((req.result as unknown[]) ?? []));
+          readResult("folder list failed", () => normalizeFolders((req.result as unknown[]) ?? []), resolve, reject);
         };
-        req.onerror = () => reject(req.error ?? new Error("folder list failed"));
+        req.onerror = () => failRead(reject, req.error, "folder list failed");
       }),
   );
 }
@@ -643,14 +714,21 @@ export function listFolderViews(): Promise<Record<string, FolderView>> {
         const tx = db.transaction("folderViews", "readonly");
         const req = tx.objectStore("folderViews").getAll();
         req.onsuccess = () => {
-          const views: Record<string, FolderView> = {};
-          for (const row of (req.result as { id?: string }[]) ?? []) {
-            if (!row || typeof row.id !== "string" || !row.id) continue;
-            views[row.id] = normalizeFolderView(row);
-          }
-          resolve(views);
+          readResult(
+            "view list failed",
+            () => {
+              const views: Record<string, FolderView> = {};
+              for (const row of (req.result as { id?: string }[]) ?? []) {
+                if (!row || typeof row.id !== "string" || !row.id) continue;
+                views[row.id] = normalizeFolderView(row);
+              }
+              return views;
+            },
+            resolve,
+            reject,
+          );
         };
-        req.onerror = () => reject(req.error ?? new Error("view list failed"));
+        req.onerror = () => failRead(reject, req.error, "view list failed");
       }),
   );
 }
@@ -693,13 +771,18 @@ export function listTagFolders(): Promise<TagFolder[]> {
         const tx = db.transaction("tagFolders", "readonly");
         const req = tx.objectStore("tagFolders").getAll();
         req.onsuccess = () => {
-          const folders = ((req.result as unknown[]) ?? [])
-            .map((row) => normalizeTagFolder(row))
-            .filter((row): row is TagFolder => row !== null)
-            .sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
-          resolve(folders);
+          readResult(
+            "tag folder list failed",
+            () =>
+              ((req.result as unknown[]) ?? [])
+                .map((row) => normalizeTagFolder(row))
+                .filter((row): row is TagFolder => row !== null)
+                .sort((a, b) => a.order - b.order || a.createdAt - b.createdAt),
+            resolve,
+            reject,
+          );
         };
-        req.onerror = () => reject(req.error ?? new Error("tag folder list failed"));
+        req.onerror = () => failRead(reject, req.error, "tag folder list failed");
       }),
   );
 }
@@ -766,13 +849,18 @@ export function listTags(): Promise<Tag[]> {
         const tx = db.transaction("tags", "readonly");
         const req = tx.objectStore("tags").getAll();
         req.onsuccess = () => {
-          const tags = ((req.result as unknown[]) ?? [])
-            .map((row) => normalizeTag(row))
-            .filter((row): row is Tag => row !== null)
-            .sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
-          resolve(tags);
+          readResult(
+            "tag list failed",
+            () =>
+              ((req.result as unknown[]) ?? [])
+                .map((row) => normalizeTag(row))
+                .filter((row): row is Tag => row !== null)
+                .sort((a, b) => a.order - b.order || a.createdAt - b.createdAt),
+            resolve,
+            reject,
+          );
         };
-        req.onerror = () => reject(req.error ?? new Error("tag list failed"));
+        req.onerror = () => failRead(reject, req.error, "tag list failed");
       }),
   );
 }

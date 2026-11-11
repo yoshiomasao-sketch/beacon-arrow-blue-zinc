@@ -31,6 +31,7 @@ export type OriginalDragSink = {
   effectAllowed: string;
   setData: (type: string, value: string) => void;
   items: { add: (file: File) => unknown; clear?: () => void };
+  files?: ArrayLike<File>;
 };
 
 /** A File around the stored original bytes. Does not re-encode or write anything back. */
@@ -43,19 +44,28 @@ export function fileFromOriginal(meta: { name: string; mime: string; addedAt: nu
 
 /**
  * Offer the original file to another app.
- * String types mark the drag as ours so the gallery does not import a copy of itself.
+ * Leaves the browser's own image file in place — clearing it drops the bitmap
+ * Chrome would hand to another window, and a script-added file is not a reliable
+ * replacement there. DownloadURL carries the real name for desktop drops.
  */
-export function writeOriginalDrag(sink: OriginalDragSink, id: string, file: File): void {
-  try {
-    sink.items.clear?.();
-  } catch {
-    /* a protected drag store can still accept setData and add */
-  }
+export function writeOriginalDrag(sink: OriginalDragSink, id: string, file: File, url?: string): void {
   sink.effectAllowed = "copy";
   sink.setData(SHOT_DRAG, id);
   sink.setData(OWN_FILE_DRAG, id);
   sink.setData("text/plain", file.name);
-  sink.items.add(file);
+  if (url && /^(blob:|https?:|data:)/.test(url)) {
+    const mime = file.type || "application/octet-stream";
+    const name = file.name.replace(/:/g, "_");
+    sink.setData("DownloadURL", `${mime}:${name}:${url}`);
+  }
+  const existing = Array.from(sink.files ?? []);
+  const hasBitmap = existing.some((item) => item.size > 0 && item.type.startsWith("image/"));
+  if (hasBitmap) return;
+  try {
+    sink.items.add(file);
+  } catch {
+    /* the image element is already carrying the bitmap */
+  }
 }
 
 function remember(id: string, file: File): void {
@@ -84,6 +94,47 @@ export function releaseAllOriginals(): void {
 
 export function cachedOriginal(id: string): File | null {
   return ready.get(id) ?? null;
+}
+
+/** Keep a File for a blob the viewer already loaded, so a drag does not read it again. */
+export function offerOriginal(meta: { id: string; name: string; mime: string; addedAt: number }, blob: Blob): File {
+  const hit = ready.get(meta.id);
+  if (hit) return hit;
+  const file = fileFromOriginal(meta, blob);
+  remember(meta.id, file);
+  pending.delete(meta.id);
+  return file;
+}
+
+let blankDrag: HTMLCanvasElement | null = null;
+
+/** Hide the browser's default drag ghost so it does not sit on top of the in-page pull. */
+export function hideNativeDragImage(transfer: DataTransfer): void {
+  if (typeof document === "undefined") return;
+  if (!blankDrag) {
+    blankDrag = document.createElement("canvas");
+    blankDrag.width = 1;
+    blankDrag.height = 1;
+  }
+  try {
+    transfer.setDragImage(blankDrag, 0, 0);
+  } catch {
+    /* the file payload still leaves with the drag */
+  }
+}
+
+let ownDragDepth = 0;
+
+export function beginOwnFileDrag(): void {
+  ownDragDepth += 1;
+}
+
+export function endOwnFileDrag(): void {
+  ownDragDepth = Math.max(0, ownDragDepth - 1);
+}
+
+export function ownFileDragActive(): boolean {
+  return ownDragDepth > 0;
 }
 
 /** Builds a File from the stored original. Does not write anything back. */
