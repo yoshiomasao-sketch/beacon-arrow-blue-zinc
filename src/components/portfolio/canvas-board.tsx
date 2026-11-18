@@ -1,6 +1,9 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
 import { forgetPersistedInk, ImageInk, type CanvasInkApi } from "@/components/portfolio/ink-layer";
+import { DotFilter } from "@/components/portfolio/dot-filter";
+import { activeDot, dotView } from "@/lib/portfolio/dot-filter";
+import { dotRecipe, paintDotCanvas, recipeIsPlain, recipeKey } from "@/lib/portfolio/dot-recipe";
 import {
   CANVAS_BOARD_ID,
   CANVAS_FLAT_PREFIX,
@@ -53,6 +56,37 @@ type Draft = {
   snapshot: CanvasPlacement | null;
   fresh: boolean;
 };
+
+function CanvasPicture({
+  src,
+  alt,
+  fade,
+  cols,
+  colors,
+  live,
+  sourceKey,
+  recipe = null,
+  recipeKey: paintKey = "",
+}: {
+  src: string;
+  alt: string;
+  fade?: CSSProperties;
+  cols: number | null;
+  colors: number | null;
+  live: boolean;
+  sourceKey: string;
+  recipe?: ReturnType<typeof dotRecipe> | null;
+  recipeKey?: string;
+}) {
+  const ref = useRef<HTMLImageElement>(null);
+  const active = cols != null || colors != null || paintKey !== "";
+  return (
+    <>
+      <img ref={ref} src={src} alt={alt} draggable={false} className={active ? "is-dot-hidden" : undefined} style={fade} />
+      {active ? <DotFilter sourceRef={ref} cols={cols} colors={colors} live={live} recipe={recipe} recipeKey={paintKey} sourceKey={sourceKey} style={fade} /> : null}
+    </>
+  );
+}
 
 function fittedSheet(width: number, height: number, sheetW: number, sheetH: number): { width: number; height: number } {
   const pad = 42;
@@ -841,11 +875,30 @@ export function CanvasBoard({ images, libraryEpoch, ready }: { images: ImageMeta
           if (!blob || blob.size < 1) continue;
           bitmap = await createImageBitmap(blob);
           const itemHeight = heights.get(placement.id) ?? placement.width;
+          const image = imagesRef.current.find((item) => item.id === placement.imageId);
+          const paint = activeDot(!wantsFlat && image && image.mime.startsWith("image/") ? image.dot : null);
+          const recipe = !wantsFlat && image && image.mime.startsWith("image/") && dotView(image.dot).show ? dotRecipe(image.dot) : null;
+          const fancy = recipe != null && !recipeIsPlain(recipe);
           ctx.save();
           ctx.translate(placement.x, placement.y);
           ctx.rotate((placement.rotation * Math.PI) / 180);
           ctx.globalAlpha = placementAlpha(placement.opacity);
-          ctx.drawImage(bitmap, -placement.width / 2, -itemHeight / 2, placement.width, itemHeight);
+          if (paint.cols != null || paint.colors != null || fancy) {
+            const dotted = document.createElement("canvas");
+            dotted.width = bitmap.width;
+            dotted.height = bitmap.height;
+            const dotCtx = dotted.getContext("2d", { alpha: true });
+            if (dotCtx) {
+              dotCtx.drawImage(bitmap, 0, 0);
+              paintDotCanvas(dotCtx, paint.cols, paint.colors, recipe);
+              ctx.imageSmoothingEnabled = false;
+              ctx.drawImage(dotted, -placement.width / 2, -itemHeight / 2, placement.width, itemHeight);
+            } else {
+              ctx.drawImage(bitmap, -placement.width / 2, -itemHeight / 2, placement.width, itemHeight);
+            }
+          } else {
+            ctx.drawImage(bitmap, -placement.width / 2, -itemHeight / 2, placement.width, itemHeight);
+          }
           ctx.restore();
         } catch {
           /* skip a picture that cannot be read; the rest of the sheet still exports */
@@ -1121,6 +1174,10 @@ export function CanvasBoard({ images, libraryEpoch, ready }: { images: ImageMeta
     const ready = Boolean(shown && !waiting && shown.flat === (placement.flat === true));
     const fade = placementAlpha(placement.opacity);
     const fadeStyle = fade < 0.999 ? { opacity: fade } : undefined;
+    const paint = activeDot(image && placement.flat !== true && image.mime.startsWith("image/") ? image.dot : null);
+    const view = dotView(image && placement.flat !== true && image.mime.startsWith("image/") ? image.dot : null);
+    const recipe = view.show && image ? dotRecipe(image.dot) : null;
+    const paintKey = recipe ? recipeKey(recipe) : "";
     return (
       <div
         key={placement.id}
@@ -1150,7 +1207,17 @@ export function CanvasBoard({ images, libraryEpoch, ready }: { images: ImageMeta
         }}
       >
         {ready && shown ? (
-          <img src={shown.url} alt={image?.name ?? ""} draggable={false} style={fadeStyle} />
+          <CanvasPicture
+            src={shown.url}
+            alt={image?.name ?? ""}
+            fade={fadeStyle}
+            cols={paint.cols}
+            colors={paint.colors}
+            live={Boolean(image?.animated)}
+            recipe={recipe}
+            recipeKey={paintKey}
+            sourceKey={`${placement.id}:${paint.cols ?? 0}:${paint.colors ?? 0}:${paintKey}`}
+          />
         ) : waiting ? null : (
           <div className="canvas-missing" style={{ fontSize: 14 * chrome, ...fadeStyle }}>
             {missing[placement.id] ? "元画像なし" : ""}

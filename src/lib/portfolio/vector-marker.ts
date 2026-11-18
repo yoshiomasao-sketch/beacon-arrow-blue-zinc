@@ -4,12 +4,11 @@
  * overlap with this marker's「普通」falloff. Playback hides the rings.
  */
 
-import { hitUnit } from "./image-animation.ts";
-import { clampRadius, clampUnit, clampView, influence, markerView, puruDeformWeight, puruHaloBackground, puruKindFace, type PuruKind, type PuruMarker } from "./purupuru.ts";
+import { clampRadius, clampUnit, clampView, influence, markerOff, markerView, puruDeformWeight, puruHaloBackground, puruKindFace, type PuruKind, type PuruMarker } from "./purupuru.ts";
 
 export { puruDeformWeight };
 
-export type VectorKind = "orbit" | "orbitBack" | "sway" | "hit" | "buzz";
+export type VectorKind = "orbit" | "orbitBack" | "sway" | "push" | "hit" | "expand" | "shrink" | "react" | "buzz";
 export type VectorPace = "slow" | "normal" | "fast";
 
 export type VectorMarker = {
@@ -28,6 +27,13 @@ export type VectorMarker = {
    * 1 is today's default. It does not change the circle. Missing means 1.
    */
   span?: number;
+  /** Parked. Missing means the marker still stimulates the mesh. */
+  off?: boolean;
+  /**
+   * Half a cycle ahead of the shared clock. Missing means the downbeat.
+   * The offset is half of this marker's own period, not a fixed number of seconds.
+   */
+  backbeat?: boolean;
 };
 
 export type VectorPose = { x: number; y: number; rotate: number };
@@ -36,7 +42,11 @@ export const VECTOR_KINDS: { id: VectorKind; label: string; hint: string; color:
   { id: "orbit", label: "円", hint: "時計回り", color: "#3DABFF" },
   { id: "orbitBack", label: "逆円", hint: "反時計回り", color: "#8B7CFF" },
   { id: "sway", label: "揺れ", hint: "往復", color: "#3DDC97" },
+  { id: "push", label: "プッシュ", hint: "押し出し", color: "#C8F54A" },
   { id: "hit", label: "打ち付け", hint: "打ち付け", color: "#FF5A7A" },
+  { id: "expand", label: "膨張", hint: "中心から外へ", color: "#FF9B3D" },
+  { id: "shrink", label: "縮小", hint: "外から中心へ", color: "#3EC6E0" },
+  { id: "react", label: "反応", hint: "反応", color: "#F08A3C" },
   { id: "buzz", label: "バイブ", hint: "振動", color: "#E6C35C" },
 ];
 
@@ -48,82 +58,121 @@ export const VECTOR_PACES: { id: VectorPace; label: string }[] = [
 
 export type MarkerListEntry = {
   id: number;
-  group: "ぷるぷる" | "ベクトル";
+  group: "ぷるぷる" | "ベクトル" | "エフェクト";
   name: string;
   pace: string | null;
+  /** Same color as the marker ring. Not a separate palette. */
+  color: string;
+  /** Parked. The row stays, but the marker does not deform. */
+  off: boolean;
+  /** Half a period ahead. Puru rows stay on the downbeat. */
+  backbeat: boolean;
 };
 
 /** Array order is the addition order. Position, size, angle, and kind changes must not sort this. */
-export function puruListEntries(markers: readonly Pick<PuruMarker, "id" | "kind">[]): MarkerListEntry[] {
-  return markers.map((marker) => ({
-    id: marker.id,
-    group: "ぷるぷる",
-    name: puruKindFace(marker.kind as PuruKind).label,
-    pace: null,
-  }));
+export function puruListEntries(markers: readonly Pick<PuruMarker, "id" | "kind" | "off">[]): MarkerListEntry[] {
+  return markers.map((marker) => {
+    const face = puruKindFace(marker.kind as PuruKind);
+    return {
+      id: marker.id,
+      group: "ぷるぷる",
+      name: face.label,
+      pace: null,
+      color: face.color,
+      off: markerOff(marker),
+      backbeat: false,
+    };
+  });
 }
 
-export function vectorListEntries(markers: readonly Pick<VectorMarker, "id" | "kind" | "pace">[]): MarkerListEntry[] {
-  return markers.map((marker) => ({
-    id: marker.id,
-    group: "ベクトル",
-    name: vectorKindFace(marker.kind).label,
-    pace: VECTOR_PACES.find((pace) => pace.id === marker.pace)?.label ?? null,
-  }));
+export function vectorListEntries(markers: readonly Pick<VectorMarker, "id" | "kind" | "pace" | "off" | "backbeat">[]): MarkerListEntry[] {
+  return markers.map((marker) => {
+    const face = vectorKindFace(marker.kind);
+    return {
+      id: marker.id,
+      group: "ベクトル",
+      name: face.label,
+      pace: VECTOR_PACES.find((pace) => pace.id === marker.pace)?.label ?? null,
+      color: face.color,
+      off: markerOff(marker),
+      backbeat: marker.backbeat === true,
+    };
+  });
 }
 
 /**
- * Rings after ■ stops a running vector playback.
- * A favorite recall returns to the photo alone. A manual「マーカーを再生」shows the rings again, without entering placement.
+ * Rings stay hidden after ■ stops vector playback, whether it started
+ * from a favorite or from「マーカーを再生」. Editing is a separate mode.
  */
-export function vectorShownAfterStop(source: "favorite" | "marker", phone: boolean, count: number): boolean {
-  if (source === "favorite" || phone || !(count > 0)) return false;
-  return true;
+export function vectorShownAfterStop(_source: "favorite" | "marker", _phone: boolean, _count: number): boolean {
+  return false;
 }
 
-/** 「普通」matches the old fixed clock for 揺れ and 打ち付け. 「遅」is twice as long, 「速」is half. */
+/** 「打ち付け」の普通。遅はその2倍の時間、速はその半分。速度比は遅:普通:速 = 1:2:4。 */
+const HIT_NORMAL_MS = 1280;
+/** 所要時間の倍率。速度はその逆数。 */
 const PACE_TIME: Record<VectorPace, number> = { slow: 2, normal: 1, fast: 0.5 };
 
-const CYCLE_MS: Record<Exclude<VectorKind, "buzz" | "orbit" | "orbitBack">, number> = {
-  sway: 1600,
-  hit: 1280,
-};
+/**
+ * 円・逆円・揺れ・打ち付け・膨張・縮小が共有する1ループ。
+ * 軌道は変えず、ループの長さだけを打ち付けに揃える。
+ */
+function sharedCycle(pace: VectorPace): number {
+  return HIT_NORMAL_MS * PACE_TIME[pace];
+}
 
 /**
- * Orbit paces slide one step, and 逆円 shares them.
- * 遅 is the previous 普通: one turn in 2800ms, travel 0.34.
- * 普通 is the previous 速: one turn in 1400ms, travel 0.34.
- * 速 is a new wider circle at half that period, still one clean turn.
+ * 円の速だけ半径が広い。遅・普通は TRAVEL のまま。時間を揃えてもこの半径は変えない。
+ * 逆円も同じ半径を使う。
  */
-const ORBIT_SLOW_MS = 2800;
-const ORBIT_NORMAL_MS = 1400;
-const ORBIT_FAST_MS = 700;
-/** Fast path radius as a fraction of the drawn circle. Slow and normal stay at TRAVEL. */
 const ORBIT_FAST_TRAVEL = 0.62;
 
 /**
- * Buzz paces are not one waveform played slower.
- * 普通 is the previous 速: five swings in 520ms, amplitude unchanged.
- * 速 repeats that same swing faster, at a rate a 60fps mesh can still follow.
- * 遅 is one hard kick, an elastic return, then a full second of rest.
+ * バイブは、以前のバイブ・普通の5往復を基準にする。
+ * 遅はその半分の速度、速は遅の4倍（普通の2倍）。
+ * 普通は 512ms。打ち付け・遅の2ループ（5120ms）に、遅5回・普通10回・速20回で収まる。
+ * 反応は、以前のバイブ・遅のキックと休み。普通は遅の2倍、速は遅の4倍。
  */
 const BUZZ_WAVES = 5;
-const BUZZ_NORMAL_MS = 520;
-const BUZZ_FAST_MS = 320;
-const BUZZ_SLOW_PULSE_MS = 320;
-const BUZZ_SLOW_WAIT_MS = 1000;
-const BUZZ_SLOW_MS = BUZZ_SLOW_PULSE_MS + BUZZ_SLOW_WAIT_MS;
+const BUZZ_NORMAL_MS = 512;
+const BUZZ_SLOW_KICK_SHARE = 320;
+const BUZZ_SLOW_REST_SHARE = 1000;
 /** Kick peak relative to the shared 0.14 travel. About two and a half times 普通. */
 const BUZZ_SLOW_GAIN = 2.5;
+/**
+ * Saved vector lists without this mark still store バイブ・遅 for the kick.
+ * Reading one of those moves that marker to 反応・遅. New saves write the mark,
+ * so a バイブ・遅 placed after this change stays a バイブ.
+ */
+export const VECTOR_VIBE = 2;
 
-/** How far the center travels, as a fraction of the drawn radius. Buzz stays small except for its slow kick. */
-const TRAVEL: Record<VectorKind, number> = {
+/** How far the center travels, as a fraction of the drawn radius. Buzz and react stay small; the react kick is louder. */
+const TRAVEL: Record<Exclude<VectorKind, "expand" | "shrink">, number> = {
   orbit: 0.34,
   orbitBack: 0.34,
   sway: 0.46,
+  push: 0.5,
   hit: 0.52,
   buzz: 0.14,
+  react: 0.14,
 };
+
+/**
+ * 膨張・縮小の強さ。点の移動量は、中心からの距離にこの倍率を掛け、既存の減衰を掛ける。
+ * 中心では距離が 0 なので動かず、向きは決まらない。
+ */
+const RADIAL_GAIN = 0.85;
+
+function radialKind(kind: VectorKind): kind is "expand" | "shrink" {
+  return kind === "expand" || kind === "shrink";
+}
+
+/** One outward or inward pull. 0 at both ends of the cycle, 1 in the middle, flat slope at the seam. */
+function radialPulse(phase: number): number {
+  const t = ((phase % 1) + 1) % 1;
+  const s = Math.sin(Math.PI * t);
+  return s * s;
+}
 
 const KIND_IDS = new Set<string>(VECTOR_KINDS.map((kind) => kind.id));
 const PACE_IDS = new Set<string>(VECTOR_PACES.map((pace) => pace.id));
@@ -155,16 +204,22 @@ export function vectorKindFace(kind: VectorKind) {
 
 export function vectorCycle(kind: VectorKind, pace: VectorPace): number {
   if (kind === "buzz") {
-    if (pace === "slow") return BUZZ_SLOW_MS;
-    if (pace === "fast") return BUZZ_FAST_MS;
+    if (pace === "slow") return BUZZ_NORMAL_MS * 2;
+    if (pace === "fast") return BUZZ_NORMAL_MS / 2;
     return BUZZ_NORMAL_MS;
   }
-  if (kind === "orbit" || kind === "orbitBack") {
-    if (pace === "slow") return ORBIT_SLOW_MS;
-    if (pace === "fast") return ORBIT_FAST_MS;
-    return ORBIT_NORMAL_MS;
+  if (kind === "react") {
+    const slow = sharedCycle("normal");
+    if (pace === "normal") return slow / 2;
+    if (pace === "fast") return slow / 4;
+    return slow;
   }
-  return CYCLE_MS[kind] * PACE_TIME[pace];
+  return sharedCycle(pace);
+}
+
+/** GIFの収録時間。打ち付け・遅の2ループ。周期を変えるときはここから取る。 */
+export function favoriteRecordMs(): number {
+  return vectorCycle("hit", "slow") * 2;
 }
 
 export function wrapAngle(rad: number): number {
@@ -183,15 +238,21 @@ export function vectorHalo(color: string): string {
   return puruHaloBackground(color, "mid");
 }
 
-function phaseOf(elapsedMs: number, cycle: number): number {
-  if (!(cycle > 0)) return 0;
+/**
+ * Phase inside one loop, from 0 up to but not including 1.
+ * A backbeat marker is half a cycle ahead and stays there on every later loop.
+ * Changing the period changes the offset with it. It is not a stored delay in milliseconds.
+ */
+export function cyclePhase(elapsedMs: number, cycle: number, backbeat = false): number {
+  if (!(cycle > 0) || !Number.isFinite(elapsedMs)) return backbeat ? 0.5 : 0;
   const t = elapsedMs % cycle;
-  return (t < 0 ? t + cycle : t) / cycle;
+  const phase = (t < 0 ? t + cycle : t) / cycle;
+  return backbeat ? (phase + 0.5) % 1 : phase;
 }
 
 /**
  * One 遅 kick. 0 at rest, 1 at the top of a fast rise, then a small elastic
- * dip back to 0. The second of silence is not part of this curve.
+ * dip back to 0. The rest after the kick is not part of this curve.
  */
 function buzzKick(u: number): number {
   if (!(u > 0) || u >= 1) return 0;
@@ -206,28 +267,58 @@ function buzzKick(u: number): number {
   return back;
 }
 
-/** 普通 and 速 share five swings. 遅 is the kick, then exact rest. Span is applied by the caller. */
-function buzzUnit(pace: VectorPace, phase: number): number {
-  if (pace === "slow") {
-    const pulse = BUZZ_SLOW_PULSE_MS / BUZZ_SLOW_MS;
+/** バイブは5往復。反応は以前のバイブ・遅と同じキックのあと休み。速度は周期だけを変える。 */
+function buzzUnit(kind: "buzz" | "react", phase: number): number {
+  if (kind === "react") {
+    const pulse = BUZZ_SLOW_KICK_SHARE / (BUZZ_SLOW_KICK_SHARE + BUZZ_SLOW_REST_SHARE);
     if (!(phase < pulse)) return 0;
     return buzzKick(phase / pulse) * BUZZ_SLOW_GAIN;
   }
   return Math.sin(phase * Math.PI * 2 * BUZZ_WAVES);
 }
 
+/** One push from the center and back. 0 at both ends, 1 halfway, flat at the seam. */
+function pushUnit(phase: number): number {
+  const t = ((phase % 1) + 1) % 1;
+  const s = Math.sin(Math.PI * t);
+  return s * s;
+}
+
+/** Pull, a short hold, then a slam back to the center. The last piece is the impact stop. */
+const HIT_PULL_END = 0.46;
+const HIT_HOLD_END = 0.58;
+const HIT_SLAM_END = 0.78;
+
+function hitVectorUnit(phase: number): number {
+  const t = ((phase % 1) + 1) % 1;
+  if (t < HIT_PULL_END) {
+    const u = t / HIT_PULL_END;
+    return u * u * (3 - 2 * u);
+  }
+  if (t < HIT_HOLD_END) return 1;
+  if (t < HIT_SLAM_END) {
+    const u = (t - HIT_HOLD_END) / (HIT_SLAM_END - HIT_HOLD_END);
+    return 1 - u * u * u;
+  }
+  return 0;
+}
+
 /**
  * Motion of the marker center, in pixels, at full strength.
  * Orbit spins clockwise. Orbit-back only flips that spin.
- * Angle is a direction for sway, hit, and buzz, and a phase offset for the circles.
+ * Angle is a direction for sway, push, hit, and buzz, and a phase offset for the circles.
+ * Sway still travels both ways. Push and hit leave the center along the angle and come back.
  */
-export function vectorMotion(marker: Pick<VectorMarker, "kind" | "pace" | "angle" | "span">, elapsedMs: number, drawn: number): VectorPose {
+export function vectorMotion(marker: Pick<VectorMarker, "kind" | "pace" | "angle" | "span" | "backbeat">, elapsedMs: number, drawn: number): VectorPose {
+  const angle = wrapAngle(marker.angle);
+  if (radialKind(marker.kind)) {
+    return { x: 0, y: 0, rotate: (angle * 180) / Math.PI };
+  }
   const radius = Math.max(0, drawn);
   const cycle = vectorCycle(marker.kind, marker.pace);
-  const phase = phaseOf(elapsedMs, cycle);
+  const phase = cyclePhase(elapsedMs, cycle, marker.backbeat === true);
   const travelScale = (marker.kind === "orbit" || marker.kind === "orbitBack") && marker.pace === "fast" ? ORBIT_FAST_TRAVEL : TRAVEL[marker.kind];
   const travel = radius * travelScale * vectorSpan(marker);
-  const angle = wrapAngle(marker.angle);
   if (marker.kind === "orbit" || marker.kind === "orbitBack") {
     const dir = marker.kind === "orbit" ? 1 : -1;
     const spin = angle + dir * phase * Math.PI * 2;
@@ -239,10 +330,12 @@ export function vectorMotion(marker: Pick<VectorMarker, "kind" | "pace" | "angle
   }
   const along =
     marker.kind === "hit"
-      ? hitUnit(phase) * travel
-      : marker.kind === "buzz"
-        ? buzzUnit(marker.pace, phase) * travel
-        : Math.sin(phase * Math.PI * 2) * travel;
+      ? hitVectorUnit(phase) * travel
+      : marker.kind === "push"
+        ? pushUnit(phase) * travel
+        : marker.kind === "buzz" || marker.kind === "react"
+          ? buzzUnit(marker.kind, phase) * travel
+          : Math.sin(phase * Math.PI * 2) * travel;
   return {
     x: Math.cos(angle) * along,
     y: Math.sin(angle) * along,
@@ -251,7 +344,7 @@ export function vectorMotion(marker: Pick<VectorMarker, "kind" | "pace" | "angle
 }
 
 /** Full center motion times the「普通」falloff at `dist` pixels from the marker. */
-export function vectorShift(marker: Pick<VectorMarker, "kind" | "pace" | "angle" | "span">, elapsedMs: number, dist: number, drawn: number): { x: number; y: number } {
+export function vectorShift(marker: Pick<VectorMarker, "kind" | "pace" | "angle" | "span" | "backbeat">, elapsedMs: number, dist: number, drawn: number): { x: number; y: number } {
   const pose = vectorMotion(marker, elapsedMs, drawn);
   const weight = vectorWeight(dist, drawn);
   return { x: pose.x * weight, y: pose.y * weight };
@@ -263,7 +356,7 @@ export function vectorShift(marker: Pick<VectorMarker, "kind" | "pace" | "angle"
  * Outside the「普通」reach the shift is zero.
  */
 export function vectorMeshShift(
-  markers: readonly Pick<VectorMarker, "kind" | "pace" | "angle" | "span" | "u" | "v" | "radius" | "view">[],
+  markers: readonly Pick<VectorMarker, "kind" | "pace" | "angle" | "span" | "u" | "v" | "radius" | "view" | "off" | "backbeat">[],
   elapsedMs: number,
   x: number,
   y: number,
@@ -276,11 +369,23 @@ export function vectorMeshShift(
   let dy = 0;
   let weight = 0;
   for (const marker of markers) {
+    if (markerOff(marker)) continue;
     const drawn = marker.radius * markerView(marker) * minSide;
     if (!(drawn > 0)) continue;
     const dist = Math.hypot(x - marker.u * width, y - marker.v * height);
     const w = vectorWeight(dist, drawn);
     if (w <= 0) continue;
+    if (radialKind(marker.kind)) {
+      const phase = cyclePhase(elapsedMs, vectorCycle(marker.kind, marker.pace), marker.backbeat === true);
+      const gain = RADIAL_GAIN * vectorSpan(marker) * radialPulse(phase);
+      const dir = marker.kind === "shrink" ? -1 : 1;
+      const ox = x - marker.u * width;
+      const oy = y - marker.v * height;
+      dx += dir * ox * gain * w;
+      dy += dir * oy * gain * w;
+      weight += w;
+      continue;
+    }
     const pose = vectorMotion(marker, elapsedMs, drawn);
     dx += pose.x * w;
     dy += pose.y * w;
@@ -299,8 +404,8 @@ export function vectorMeshShift(
  * so a wide vector circle cannot pull pixels the puru mesh does not cover.
  */
 export function vectorOnMesh(
-  vectors: readonly Pick<VectorMarker, "kind" | "pace" | "angle" | "span" | "u" | "v" | "radius" | "view">[],
-  puru: readonly Pick<PuruMarker, "kind" | "u" | "v" | "radius" | "view">[],
+  vectors: readonly Pick<VectorMarker, "kind" | "pace" | "angle" | "span" | "u" | "v" | "radius" | "view" | "off" | "backbeat">[],
+  puru: readonly Pick<PuruMarker, "kind" | "u" | "v" | "radius" | "view" | "off">[],
   elapsedMs: number,
   x: number,
   y: number,
@@ -389,16 +494,20 @@ export function normalizeVectorMarkers(raw: unknown): VectorMarker[] | null {
   const seen = new Set<number>();
   for (const entry of markers) {
     if (!entry || typeof entry !== "object") continue;
-    const row = entry as { id?: unknown; kind?: unknown; pace?: unknown; u?: unknown; v?: unknown; radius?: unknown; view?: unknown; angle?: unknown; span?: unknown };
+    const legacy = (raw as { vibe?: unknown }).vibe !== VECTOR_VIBE;
+    const row = entry as { id?: unknown; kind?: unknown; pace?: unknown; u?: unknown; v?: unknown; radius?: unknown; view?: unknown; angle?: unknown; span?: unknown; off?: unknown; backbeat?: unknown };
     if (typeof row.id !== "number" || !Number.isFinite(row.id) || seen.has(row.id)) continue;
     if (typeof row.kind !== "string" || !KIND_IDS.has(row.kind)) continue;
     if (typeof row.u !== "number" || typeof row.v !== "number" || typeof row.radius !== "number") continue;
     if (!Number.isFinite(row.u) || !Number.isFinite(row.v) || !Number.isFinite(row.radius)) continue;
     seen.add(row.id);
+    let kind = row.kind as VectorKind;
+    const pace = typeof row.pace === "string" && PACE_IDS.has(row.pace) ? (row.pace as VectorPace) : "normal";
+    if (legacy && kind === "buzz" && pace === "slow") kind = "react";
     const marker: VectorMarker = {
       id: row.id,
-      kind: row.kind as VectorKind,
-      pace: typeof row.pace === "string" && PACE_IDS.has(row.pace) ? (row.pace as VectorPace) : "normal",
+      kind,
+      pace,
       u: clampUnit(row.u),
       v: clampUnit(row.v),
       radius: clampRadius(row.radius),
@@ -406,6 +515,8 @@ export function normalizeVectorMarkers(raw: unknown): VectorMarker[] | null {
       span: clampSpan(typeof row.span === "number" ? row.span : 1),
     };
     if (typeof row.view === "number" && Number.isFinite(row.view)) marker.view = clampView(row.view);
+    if (row.off === true) marker.off = true;
+    if (row.backbeat === true) marker.backbeat = true;
     out.push(marker);
   }
   return out;

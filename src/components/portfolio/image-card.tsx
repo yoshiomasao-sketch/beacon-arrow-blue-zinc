@@ -4,12 +4,16 @@ import { createPortal } from "react-dom";
 import { readInk, readPixels } from "@/lib/portfolio/db";
 import { primeOriginal } from "@/lib/portfolio/export-file";
 import { type FlowBox } from "@/lib/portfolio/logic";
+import { integerPixelFit, isSmallPixelArt } from "@/lib/portfolio/sprite-sheet";
 import { SHOT_TIMEOUT_MS, shotAfterFailure, shotRetryDelay } from "@/lib/portfolio/shot-load";
 import { invalidateThumb, loadThumb, peekThumb, pinThumb } from "@/lib/portfolio/thumbs";
 import { TAG_DRAG, type ImageMeta, type Tag } from "@/lib/portfolio/types";
 import { currentTagDrag, eventIsTagDrag } from "@/lib/portfolio/tag-drag";
 import { setInkVisible, usePortfolio } from "@/lib/portfolio/store";
 import { placeSpot } from "@/components/portfolio/spot-confirm";
+import { DotFilter } from "@/components/portfolio/dot-filter";
+import { activeDot, dotView } from "@/lib/portfolio/dot-filter";
+import { dotRecipe, recipeIsPlain, recipeKey } from "@/lib/portfolio/dot-recipe";
 import { THUMB_REST, THUMB_RETURN_EASE, THUMB_RETURN_MS, thumbFollow, thumbSheen, thumbTiltEnabled, thumbTiltFromPointer, thumbUnit, type ThumbTilt } from "@/lib/portfolio/thumb-tilt";
 import { holdGallerySensor } from "@/lib/portfolio/sensor-gallery";
 import { zoomRectOf, type ZoomRect } from "@/lib/portfolio/thumb-zoom";
@@ -144,6 +148,19 @@ function placedMedia(boxW: number, boxH: number, imageW: number, imageH: number)
     height,
     right: "auto",
     bottom: "auto",
+  };
+}
+
+function pixelFitStyle(boxW: number, boxH: number, imageW: number, imageH: number): CSSProperties {
+  const fit = integerPixelFit(boxW, boxH, imageW, imageH);
+  return {
+    left: fit.x,
+    top: fit.y,
+    width: fit.width,
+    height: fit.height,
+    right: "auto",
+    bottom: "auto",
+    imageRendering: "pixelated",
   };
 }
 function isTagDrag(event: React.DragEvent): boolean {
@@ -331,6 +348,7 @@ export function ImageCard({
   viewer = false,
   gifMotion = true,
   zoomSource = false,
+  plate = "clear",
 }: {
   item: ImageMeta;
   box: FlowBox;
@@ -355,6 +373,7 @@ export function ImageCard({
   viewer?: boolean;
   gifMotion?: boolean;
   zoomSource?: boolean;
+  plate?: "clear" | "white" | "green";
 }) {
   const frameRef = useRef<HTMLDivElement>(null);
   const contactRef = useRef<HTMLDivElement>(null);
@@ -376,6 +395,11 @@ export function ImageCard({
   const hasInk = usePortfolio((state) => state.inkIds.includes(item.id));
   const inkRev = usePortfolio((state) => state.inkRev[item.id] ?? 0);
   const inkShown = item.inkVisible !== false;
+  const dot = item.dot;
+  const paint = activeDot(item.mime.startsWith("image/") ? dot : null);
+  const cardRecipe = dotRecipe(item.mime.startsWith("image/") ? dot : null);
+  const cardRecipeKey = recipeKey(cardRecipe);
+  const dotActive = paint.cols != null || paint.colors != null || (dotView(dot).show && !recipeIsPlain(cardRecipe) && item.mime.startsWith("image/"));
   const [url, setUrl] = useState<string | null>(() => peekThumb(pixelKey));
   const [status, setStatus] = useState<"loading" | "ready" | "missing" | "error">("loading");
   const [retryNonce, setRetryNonce] = useState(0);
@@ -383,7 +407,10 @@ export function ImageCard({
   const [pinned, setPinned] = useState(false);
   const [tagHot, setTagHot] = useState(false);
   const [deleteAsk, setDeleteAsk] = useState<DOMRect | null>(null);
+  const [gifSize, setGifSize] = useState<{ w: number; h: number } | null>(null);
   const deleteTrigger = useRef<HTMLButtonElement>(null);
+  const gifItem = item.animated && item.mime === "image/gif";
+  const pixelGif = gifItem && (!pauseMotion || (gifSize != null && gifSize.w === item.width && gifSize.h === item.height));
 
   useEffect(() => {
     if (!pinned) return;
@@ -631,6 +658,10 @@ export function ImageCard({
   }, [item.animated, item.id, pauseMotion, pixelKey, retryNonce]);
 
   useEffect(() => {
+    setGifSize(null);
+  }, [item.id, pauseMotion]);
+
+  useEffect(() => {
     const node = mediaRef.current;
     if (!node || !url) return;
     if (node instanceof HTMLImageElement && node.complete) {
@@ -681,7 +712,11 @@ export function ImageCard({
 
   const menu = hover || pinned;
   const fit = menuFit(box.w, box.h);
-  const mediaStyle = placedMedia(box.w, box.h, item.width, item.height);
+  const sourceW = gifSize?.w || item.width;
+  const sourceH = gifSize?.h || item.height;
+  const pixelStill = !gifItem && item.mime.startsWith("image/") && isSmallPixelArt(item.width, item.height);
+  const pixelFit = pixelGif || pixelStill;
+  const mediaStyle = pixelFit ? pixelFitStyle(box.w, box.h, sourceW, sourceH) : placedMedia(box.w, box.h, item.width, item.height);
 
   const prepareExport = () => {
     if (viewer) return;
@@ -898,7 +933,7 @@ export function ImageCard({
       >
         <div ref={frameRef} className="shot-frame">
           <div className="shot-sensor">
-          <div ref={contactRef} className="shot-contact">
+          <div ref={contactRef} className={plate === "clear" ? "shot-contact" : `shot-contact is-plate-${plate}`}>
           {origin ? <span className="shot-origin">{origin}</span> : null}
           {url && item.mime.startsWith("video/") && !pauseMotion ? (
             <video
@@ -928,10 +963,22 @@ export function ImageCard({
               height={item.height}
               decoding="async"
               draggable={false}
+              className={[dotActive ? "is-dot-hidden" : "", pixelFit ? "is-pixel-fit" : ""].filter(Boolean).join(" ") || undefined}
               style={mediaStyle}
-              onLoad={(event) => reportRef.current?.loaded(event.currentTarget.naturalWidth, event.currentTarget.naturalHeight)}
+              onLoad={(event) => {
+                const node = event.currentTarget;
+                if (gifItem) {
+                  setGifSize((current) =>
+                    current && current.w === node.naturalWidth && current.h === node.naturalHeight ? current : { w: node.naturalWidth, h: node.naturalHeight },
+                  );
+                }
+                reportRef.current?.loaded(node.naturalWidth, node.naturalHeight);
+              }}
               onError={() => reportRef.current?.failed()}
             />
+          ) : null}
+          {dotActive && url && !item.mime.startsWith("video/") ? (
+            <DotFilter sourceRef={mediaRef} cols={paint.cols} colors={paint.colors} live={item.animated && !pauseMotion} recipe={cardRecipe} recipeKey={cardRecipeKey} sourceKey={`${pixelKey}:${paint.cols ?? 0}:${paint.colors ?? 0}:${cardRecipeKey}`} style={mediaStyle} />
           ) : null}
           {hasInk && inkShown && !item.animated ? (
             <InkStill imageId={item.id} revision={inkRev} style={{ ...mediaStyle, objectFit: "fill" }} />

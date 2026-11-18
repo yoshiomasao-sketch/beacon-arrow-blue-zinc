@@ -1,8 +1,11 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { DotFilter } from "@/components/portfolio/dot-filter";
 import { FlowSaver } from "@/components/portfolio/flow-saver";
 import { Button } from "@/components/ui/button";
 import { readPixels } from "@/lib/portfolio/db";
+import { activeDot, dotView } from "@/lib/portfolio/dot-filter";
+import { dotRecipe, recipeKey, type DotRecipe } from "@/lib/portfolio/dot-recipe";
 import { flowRowOrders, type FlowRows } from "@/lib/portfolio/flow-saver";
 import {
   advanceDeck,
@@ -12,6 +15,7 @@ import {
   type SlideshowCursor,
   type SlideshowOrder,
 } from "@/lib/portfolio/slideshow";
+import { dockedSlideshowKeyAction, type DockedKeyPlace } from "@/lib/portfolio/canvas-shell";
 import { notify } from "@/lib/portfolio/store";
 import type { ImageMeta } from "@/lib/portfolio/types";
 
@@ -49,6 +53,7 @@ export function Slideshow({
   container = null,
   dock = false,
   anchor = null,
+  onPlay,
 }: {
   open: boolean;
   items: ImageMeta[];
@@ -56,6 +61,7 @@ export function Slideshow({
   container?: HTMLElement | null;
   dock?: boolean;
   anchor?: HTMLElement | null;
+  onPlay?: () => void;
 }) {
   const [order, setOrder] = useState<SlideshowOrder>("sequence");
   const [mode, setMode] = useState<SlideshowMode>("slides");
@@ -75,10 +81,10 @@ export function Slideshow({
   }, [open]);
 
   if (!open || typeof document === "undefined") return null;
+  if (dock && !container) return null;
+  const host = dock && container ? container : document.body;
 
   if (play) {
-    if (dock && !container) return null;
-    const host = container ?? document.body;
     if (play.kind === "flow") {
       return createPortal(
         <SlideshowFrame docked={dock} mode={`flow-${play.rows}`} onClose={() => onOpenChange(false)}>
@@ -109,9 +115,11 @@ export function Slideshow({
       return;
     }
     if (mode === "slides") {
+      onPlay?.();
       setPlay({ kind: "slides", items: list, order, seconds: clampSlideSeconds(seconds), showClock, zoom });
       return;
     }
+    onPlay?.();
     setPlay({ kind: "flow", items: list, rows: mode, orders: flowRowOrders(list.length, mode) });
   };
 
@@ -131,7 +139,7 @@ export function Slideshow({
       onClose={() => onOpenChange(false)}
       onStart={start}
     />,
-    document.body,
+    host,
   );
 }
 
@@ -312,6 +320,15 @@ function SlideshowSetup({
   );
 }
 
+function dockedKeyPlace(target: EventTarget | null): DockedKeyPlace {
+  if (!(target instanceof Node)) return "other";
+  if (document.querySelector(".gallery-viewer-host")?.contains(target)) return "viewer";
+  if (document.querySelector(".library-head")?.contains(target)) return "menu";
+  if (document.querySelector(".canvas-pane")?.contains(target)) return "canvas";
+  if (target === document.body || target === document.documentElement) return "page";
+  return "other";
+}
+
 function SlideshowFrame({
   docked,
   mode,
@@ -331,8 +348,12 @@ function SlideshowFrame({
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (dockedRef.current) {
-        const target = event.target;
-        if (target instanceof Node && document.querySelector(".canvas-pane")?.contains(target)) return;
+        const action = dockedSlideshowKeyAction(dockedKeyPlace(event.target), event.key);
+        if (action === "pass") return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (action === "close") onCloseRef.current();
+        return;
       }
       event.preventDefault();
       event.stopPropagation();
@@ -370,6 +391,19 @@ function SlideshowFrame({
   );
 }
 
+type SlideLayer = { token: number; url: string; on: boolean; cols: number | null; colors: number | null; animated: boolean; recipe: DotRecipe | null; recipeKey: string };
+
+function SlidePhoto({ url, cols, colors, animated, recipe, recipeKey: paintKey }: { url: string; cols: number | null; colors: number | null; animated: boolean; recipe: DotRecipe | null; recipeKey: string }) {
+  const ref = useRef<HTMLImageElement>(null);
+  const active = cols != null || colors != null || (recipe != null && paintKey !== "");
+  return (
+    <>
+      <img ref={ref} src={url} alt="" draggable={false} className={active ? "is-dot-hidden" : undefined} />
+      {active ? <DotFilter sourceRef={ref} cols={cols} colors={colors} live={animated} fit="contain" recipe={recipe} recipeKey={paintKey} sourceKey={`${url}:${cols ?? 0}:${colors ?? 0}:${paintKey}`} /> : null}
+    </>
+  );
+}
+
 function SlideshowPlayer({
   items,
   order,
@@ -387,7 +421,7 @@ function SlideshowPlayer({
   docked?: boolean;
   onClose: () => void;
 }) {
-  const [layers, setLayers] = useState<Array<{ token: number; url: string; on: boolean }>>([]);
+  const [layers, setLayers] = useState<SlideLayer[]>([]);
   const [remaining, setRemaining] = useState(seconds);
   const tokenRef = useRef(0);
   const endsAtRef = useRef(0);
@@ -444,7 +478,11 @@ function SlideshowPlayer({
       failures = 0;
       const token = tokenRef.current + 1;
       tokenRef.current = token;
-      setLayers((current) => [...current.map((layer) => ({ ...layer, on: false })), { token, url, on: false }].slice(-2));
+      const paint = activeDot(item.mime.startsWith("image/") ? item.dot : null);
+      const view = dotView(item.mime.startsWith("image/") ? item.dot : null);
+      const recipe = view.show ? dotRecipe(item.dot) : null;
+      const paintKey = recipe ? recipeKey(recipe) : "";
+      setLayers((current) => [...current.map((layer) => ({ ...layer, on: false })), { token, url, on: false, cols: paint.cols, colors: paint.colors, animated: item.animated, recipe, recipeKey: paintKey }].slice(-2));
       reveal = window.requestAnimationFrame(() => {
         reveal = window.requestAnimationFrame(() => {
           if (!alive) return;
@@ -499,7 +537,7 @@ function SlideshowPlayer({
           data-zoom={zoom ? "on" : "off"}
           style={{ ["--slide-ms" as string]: `${seconds * 1000}ms` }}
         >
-          <img src={layer.url} alt="" draggable={false} />
+          <SlidePhoto url={layer.url} cols={layer.cols} colors={layer.colors} animated={layer.animated} recipe={layer.recipe} recipeKey={layer.recipeKey} />
         </div>
       ))}
       {showClock ? (

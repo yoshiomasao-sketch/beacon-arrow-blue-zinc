@@ -88,6 +88,8 @@ export function PuruMesh({
   onImpulse,
   style,
   onReady,
+  surfaceRef,
+  still = false,
 }: {
   sourceRef: RefObject<HTMLImageElement | HTMLVideoElement | null>;
   width: number;
@@ -101,12 +103,18 @@ export function PuruMesh({
   onImpulse?: (active: boolean) => void;
   style: CSSProperties;
   onReady: (ok: boolean) => void;
+  /** The same canvas the mesh draws into, so a later filter can read the warped picture. */
+  surfaceRef?: RefObject<HTMLCanvasElement | null>;
+  /** Keep the last drawn frame. The mesh loop stays so playback can continue afterwards. */
+  still?: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;
   const onImpulseRef = useRef(onImpulse);
   onImpulseRef.current = onImpulse;
+  const stillRef = useRef(false);
+  stillRef.current = still;
   const [shown, setShown] = useState(false);
 
   useEffect(() => {
@@ -189,6 +197,7 @@ export function PuruMesh({
     let hidden = false;
     let prevSample: PuruSample | null = null;
     let prevFrame = 0;
+    let pausedAt = 0;
     let viewBody: PuruViewBody = restViewBody();
     let prevPose = { pullX: 0, pullY: 0, rx: 0, ry: 0 };
     let told = false;
@@ -222,7 +231,8 @@ export function PuruMesh({
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const bw = Math.max(1, Math.round(width * dpr));
       const bh = Math.max(1, Math.round(height * dpr));
-      if (canvas.width !== bw || canvas.height !== bh) {
+      const resized = canvas.width !== bw || canvas.height !== bh;
+      if (resized) {
         canvas.width = bw;
         canvas.height = bh;
       }
@@ -249,10 +259,20 @@ export function PuruMesh({
         hidden = false;
         told = false;
       }
+      const frozen = stillRef.current;
+      if (frozen) {
+        if (!pausedAt) pausedAt = now;
+        if (prevFrame !== 0 && !resized) return;
+      } else if (pausedAt) {
+        const vector = vectorRef?.current;
+        if (vector?.playing) vector.origin += now - pausedAt;
+        pausedAt = 0;
+        prevFrame = now;
+      }
       const sample = driveRef.current ?? { x: 0, y: 0, scale: 1, t: 0 };
-      const drive = driveFromMotion(prevSample, sample, now);
-      prevSample = { x: sample.x, y: sample.y, scale: sample.scale, t: sample.t };
-      const step = prevFrame ? Math.min(0.05, (now - prevFrame) / 1000) : 1 / 60;
+      const drive = frozen ? { vx: 0, vy: 0, dScale: 0 } : driveFromMotion(prevSample, sample, now);
+      if (!frozen) prevSample = { x: sample.x, y: sample.y, scale: sample.scale, t: sample.t };
+      const step = frozen ? 0 : prevFrame ? Math.min(0.05, (now - prevFrame) / 1000) : 1 / 60;
       prevFrame = now;
       const markers = markersRef.current ?? [];
       const minSide = Math.min(width, height);
@@ -298,7 +318,7 @@ export function PuruMesh({
       fillDisplacement(markers, posed, width, height, disp, viewLive, hitLive ? hits : null);
       const vector = vectorRef?.current;
       if (vector?.playing && vector.markers.length && markers.length) {
-        const elapsed = Math.max(0, now - vector.origin);
+        const elapsed = Math.max(0, (frozen ? pausedAt : now) - vector.origin);
         const cap = minSide * 0.34;
         for (let row = 0; row < cols; row++) {
           const y = (row / (cols - 1)) * height;
@@ -334,9 +354,11 @@ export function PuruMesh({
       }
     };
     raf = window.requestAnimationFrame(draw);
+    if (surfaceRef) surfaceRef.current = canvas;
     return () => {
       alive = false;
       window.cancelAnimationFrame(raf);
+      if (surfaceRef) surfaceRef.current = null;
       if (sourceNode instanceof HTMLImageElement) sourceNode.removeEventListener("load", markLoaded);
       gl.deleteProgram(program);
       gl.deleteShader(vert);
@@ -346,7 +368,7 @@ export function PuruMesh({
       gl.deleteBuffer(indexBuf);
       gl.deleteTexture(texture);
     };
-  }, [width, height, sourceRef, markersRef, driveRef, viewRef, impulseRef, vectorRef]);
+  }, [width, height, sourceRef, markersRef, driveRef, viewRef, impulseRef, vectorRef, surfaceRef]);
 
   const opacity = shown ? (typeof style.opacity === "number" ? style.opacity : 1) : 0;
   return <canvas ref={canvasRef} className="puru-mesh" aria-hidden="true" style={{ ...style, pointerEvents: "none", opacity }} />;

@@ -2,9 +2,9 @@
  * One JST stamp for the latest user-visible change.
  * On every feature, fix, or UI change, replace this with the time of that change.
  * Ver.YYMMDDHHMM and the Japanese date are both derived from it, so they cannot drift.
- * 2026-11-11 22:05 JST → Ver.2611112205
+ * 2026-11-18 03:46 JST → Ver.2611180346
  */
-export const APP_RELEASED_AT = "2026-11-11T22:05:00+09:00";
+export const APP_RELEASED_AT = "2026-11-18T03:46:00+09:00";
 
 const STAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\+09:00$/;
 

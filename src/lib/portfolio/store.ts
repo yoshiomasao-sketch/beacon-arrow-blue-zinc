@@ -2,7 +2,6 @@ import { useSyncExternalStore } from "react";
 import { isCanvasInkId } from "@/lib/portfolio/canvas";
 import {
   activeLibraryTab,
-  allocateOrders,
   closeLibraryConnection,
   commitFolderCopy,
   deleteFolderRecord,
@@ -30,13 +29,16 @@ import {
   putMeta,
   putTag,
   putTagFolder,
+  readInk,
   readKv,
   readKvString,
+  readPixels,
   releaseRetiredLibrary,
   rememberLibraryTab,
   resetLiveLibrary,
   resumeLibraryWrites,
   saveImage,
+  saveInk,
   setLibraryPhoneSurface,
   setUserWritesOpen,
   suspendLibraryWrites,
@@ -59,10 +61,12 @@ import {
   normalizeFolderView,
   normalizeMemo,
   normalizeTagMatch,
+  ordersAtFront,
   pasteParentId,
   planFolderCopy,
   planTagFolderRemoval,
   parseActiveTagIds,
+  sortByOrder,
   storageErrorMessage,
   type ImportStats,
   type TagMatch,
@@ -73,9 +77,15 @@ import { ImagePrepareError, prepareImage } from "./prepare.ts";
 import { forgetAllThumbs, forgetThumb } from "./thumbs.ts";
 import { clearInkHistories } from "./ink.ts";
 import { ALL_FOLDERS, DEFAULT_FOLDER_VIEW, TAG_COLORS, type DisplayScale, type Folder, type FolderView, type ImageMeta, type ImagePlay, type ImageSource, type Tag, type TagFolder } from "./types.ts";
+import { activeDot, dotView } from "./dot-filter.ts";
+import { dotRecipe, mergeDot, sameDot, type DotPatch } from "./dot-recipe.ts";
+import { dotCopyFileName } from "./display-copy.ts";
+import { pixelExportFileName } from "./pixel-board.ts";
+import { cloneDisplayEdits, composeDisplayPng, displayCopyFileName, inkCopyPlan, type ClonedDisplayEdits, type DisplayCopyLive } from "./display-copy.ts";
 import { normalizeImagePlay } from "./image-play.ts";
 import { normalizePuruMarkers, type PuruMarker } from "./purupuru.ts";
-import { normalizeVectorMarkers, type VectorMarker } from "./vector-marker.ts";
+import { normalizeVectorMarkers, VECTOR_VIBE, type VectorMarker } from "./vector-marker.ts";
+import { normalizeEffectMarkers, type EffectMarker } from "./effect-marker.ts";
 
 export type PendingAdd = {
   files: File[];
@@ -84,6 +94,13 @@ export type PendingAdd = {
 };
 
 export type SortDirection = "asc" | "desc";
+
+/** Plate behind transparent gallery pixels. Clear keeps the old transparent look. */
+export type GalleryPlate = "clear" | "white" | "green";
+
+export function galleryPlateOf(value: unknown): GalleryPlate {
+  return value === "white" || value === "green" ? value : "clear";
+}
 
 export type Notice = {
   id: string;
@@ -107,6 +124,8 @@ export type PortfolioState = {
   favoritesOnly: boolean;
   /** Decorative CSS motion. Missing or 0 stays off. */
   cssFx: boolean;
+  /** Backdrop behind transparent gallery thumbnails and the enlarge view. */
+  galleryPlate: GalleryPlate;
   tags: Tag[];
   tagFolders: TagFolder[];
   activeTagIds: string[];
@@ -141,6 +160,7 @@ const SERVER_SNAPSHOT: PortfolioState = {
   folderOpen: true,
   favoritesOnly: false,
   cssFx: false,
+  galleryPlate: "clear",
   tags: [],
   tagFolders: [],
   activeTagIds: [],
@@ -252,7 +272,7 @@ function isQuota(error: unknown): boolean {
 
 async function loadLibraryIntoState(epoch: number): Promise<void> {
   clearInkHistories();
-  const [items, folder, width, open, pane, favoritesOnly, cssFx, tags, tag, tagHidden, tagMatch, tagOpen, tagWidth, tagFolders, folderHidden, inkIdList, canvasSplit] = await Promise.all([
+  const [items, folder, width, open, pane, favoritesOnly, cssFx, galleryPlate, tags, tag, tagHidden, tagMatch, tagOpen, tagWidth, tagFolders, folderHidden, inkIdList, canvasSplit] = await Promise.all([
     listMeta(),
     readKvString("folder", ALL_FOLDERS),
     readKv("folderWidth", 240),
@@ -260,6 +280,7 @@ async function loadLibraryIntoState(epoch: number): Promise<void> {
     readKv("folderPane", 360),
     readKv("favoritesOnly", 0),
     readKv("cssFx", 0),
+    readKvString("galleryPlate", "clear"),
     listTags(),
     readKvString("tag", ""),
     readKvString("tagHidden", ""),
@@ -326,6 +347,7 @@ async function loadLibraryIntoState(epoch: number): Promise<void> {
     folderOpen: open !== 0,
     favoritesOnly: favoritesOnly === 1,
     cssFx: cssFx === 1,
+    galleryPlate: galleryPlateOf(galleryPlate),
     tags: filed,
     tagFolders,
     activeTagIds,
@@ -415,6 +437,7 @@ async function applyRetarget(ticket: number): Promise<void> {
       direction: DEFAULT_FOLDER_VIEW.direction,
       favoritesOnly: false,
       cssFx: false,
+      galleryPlate: "clear",
       tags: [],
       tagFolders: [],
       activeTagIds: [],
@@ -489,6 +512,18 @@ function inboxFolderId(): string {
   return state.folders.find((folder) => folder.name === INITIAL_FOLDER_NAME)?.id ?? state.folders[0]?.id ?? "";
 }
 
+/** Numbers that put this batch at the front of the list on screen. Other folders keep their numbers. */
+function nextImageOrders(folderId: string, count: number): number[] {
+  const existing = state.items.filter((item) => item.folderId === folderId).map((item) => item.order);
+  const onScreen = state.folderId === folderId || state.folderId === ALL_FOLDERS;
+  const direction = onScreen ? state.direction : (state.views[folderId] ?? DEFAULT_FOLDER_VIEW).direction;
+  return ordersAtFront(existing, count, direction);
+}
+
+function publishImage(meta: ImageMeta): void {
+  setState((current) => ({ ...current, items: sortByOrder([...current.items, meta]) }));
+}
+
 async function importBatch(files: File[], source: ImageSource, folderId = inboxFolderId()): Promise<void> {
   if (state.phase !== "ready") {
     pushNotice(state.bootError ?? "まだ画像ライブラリの準備ができていません。");
@@ -533,14 +568,7 @@ async function importBatch(files: File[], source: ImageSource, folderId = inboxF
   setState((current) => ({ ...current, importing: { done: 0, total: accepted.length } }));
 
   try {
-    let start = 1;
-    try {
-      start = await allocateOrders(accepted.length);
-    } catch (error) {
-      stats.failedSave = accepted.length;
-      stats.quota = isQuota(error);
-      return;
-    }
+    const orders = nextImageOrders(folderId, accepted.length);
 
     for (let index = 0; index < accepted.length; index += 1) {
       const { file, mime } = accepted[index]!;
@@ -557,7 +585,7 @@ async function importBatch(files: File[], source: ImageSource, folderId = inboxF
             height: prepared.height,
             byteSize: prepared.original.size,
             addedAt: Date.now(),
-            order: start + index,
+            order: orders[index] ?? 1,
             scale: 1,
             source,
             folderId,
@@ -568,7 +596,7 @@ async function importBatch(files: File[], source: ImageSource, folderId = inboxF
           };
           await saveImage(meta, prepared.original, prepared.thumb);
           stats.added += 1;
-          setState((current) => ({ ...current, items: [...current.items, meta] }));
+          publishImage(meta);
         } catch (error) {
           if (error instanceof ImagePrepareError) stats.failedDecode += 1;
           else {
@@ -760,71 +788,180 @@ export async function setImageMemo(id: string, memo: string): Promise<void> {
   }
 }
 
+type MetaKind = "puru" | "vectors" | "effects" | "play";
+
+type MetaJob = {
+  kind: MetaKind;
+  apply: (item: ImageMeta) => ImageMeta | null;
+  waiters: Array<(ok: boolean) => void>;
+};
+
+const metaQueue = new Map<string, MetaJob[]>();
+const metaBusy = new Set<string>();
+
+/** One write at a time per image. A newer edit of the same field replaces a write that has not started. */
+function enqueueImageMeta(id: string, kind: MetaKind, apply: (item: ImageMeta) => ImageMeta | null): Promise<boolean> {
+  return new Promise((resolve) => {
+    const queue = metaQueue.get(id) ?? [];
+    const pending = queue.find((job) => job.kind === kind);
+    if (pending) {
+      pending.apply = apply;
+      pending.waiters.push(resolve);
+    } else {
+      queue.push({ kind, apply, waiters: [resolve] });
+    }
+    metaQueue.set(id, queue);
+    void drainImageMeta(id);
+  });
+}
+
+async function drainImageMeta(id: string): Promise<void> {
+  if (metaBusy.has(id)) return;
+  metaBusy.add(id);
+  try {
+    for (;;) {
+      const queue = metaQueue.get(id);
+      if (!queue || queue.length === 0) {
+        metaQueue.delete(id);
+        break;
+      }
+      const job = queue.shift();
+      if (!job) break;
+      let ok = await runImageMetaJob(id, job, false);
+      if (!ok && !queue.some((entry) => entry.kind === job.kind)) ok = await runImageMetaJob(id, job, true);
+      for (const waiter of job.waiters) waiter(ok);
+    }
+  } finally {
+    metaBusy.delete(id);
+    const left = metaQueue.get(id);
+    if (left && left.length > 0) void drainImageMeta(id);
+  }
+}
+
+async function runImageMetaJob(id: string, job: MetaJob, notify: boolean): Promise<boolean> {
+  if (!userWritesOpen()) return false;
+  const before = state.items.find((entry) => entry.id === id);
+  if (!before) return false;
+  if (!job.apply(before)) return true;
+  let placed: ImageMeta = before;
+  setState((current) => ({
+    ...current,
+    items: current.items.map((entry) => {
+      if (entry.id !== id) return entry;
+      const merged = job.apply(entry);
+      if (!merged) return entry;
+      placed = merged;
+      return merged;
+    }),
+  }));
+  const persisted = state.items.find((entry) => entry.id === id) ?? placed;
+  try {
+    await putMeta(persisted);
+    return true;
+  } catch (error) {
+    setState((current) => ({
+      ...current,
+      items: current.items.map((entry) => {
+        if (entry.id !== id) return entry;
+        if (job.kind === "puru") {
+          if (entry.puru !== placed.puru) return entry;
+          if (before.puru === undefined) {
+            const restored = { ...entry };
+            delete restored.puru;
+            return restored;
+          }
+          return { ...entry, puru: before.puru };
+        }
+        if (job.kind === "vectors") {
+          if (entry.vectors !== placed.vectors) return entry;
+          if (before.vectors === undefined) {
+            const restored = { ...entry };
+            delete restored.vectors;
+            return restored;
+          }
+          return { ...entry, vectors: before.vectors };
+        }
+        if (job.kind === "effects") {
+          if (entry.effects !== placed.effects) return entry;
+          if (before.effects === undefined) {
+            const restored = { ...entry };
+            delete restored.effects;
+            return restored;
+          }
+          return { ...entry, effects: before.effects };
+        }
+        if (entry.play !== placed.play) return entry;
+        if (before.play === undefined) {
+          const restored = { ...entry };
+          delete restored.play;
+          return restored;
+        }
+        return { ...entry, play: before.play };
+      }),
+    }));
+    if (notify) pushNotice(storageErrorMessage(error, "save"));
+    return false;
+  }
+}
+
 /** Writes this image's marker layout. Other images are left alone. A failed write keeps the previous layout. */
 export async function saveImagePuru(id: string, markers: readonly PuruMarker[]): Promise<boolean> {
   if (!userWritesOpen()) return false;
-  const item = state.items.find((entry) => entry.id === id);
-  if (!item) return false;
+  if (!state.items.some((entry) => entry.id === id)) return false;
   const saved = normalizePuruMarkers({ markers }) ?? [];
-  const next = { ...item, puru: { markers: saved } };
-  const previous = state.items;
-  setState((current) => ({
-    ...current,
-    items: current.items.map((entry) => (entry.id === id ? next : entry)),
-  }));
-  try {
-    await putMeta(next);
-    return true;
-  } catch (error) {
-    setState((current) => ({ ...current, items: previous }));
-    pushNotice(storageErrorMessage(error, "save"));
-    return false;
-  }
+  return enqueueImageMeta(id, "puru", (item) => {
+    const current = normalizePuruMarkers(item.puru) ?? [];
+    if (JSON.stringify(current) === JSON.stringify(saved)) return null;
+    return { ...item, puru: { markers: saved } };
+  });
 }
 
 /** Writes this image's vector markers. Puru markers and the picture itself stay as they are. */
 export async function saveImageVectors(id: string, markers: readonly VectorMarker[]): Promise<boolean> {
   if (!userWritesOpen()) return false;
-  const item = state.items.find((entry) => entry.id === id);
-  if (!item) return false;
+  if (!state.items.some((entry) => entry.id === id)) return false;
   const saved = normalizeVectorMarkers({ markers }) ?? [];
-  const next = { ...item, vectors: { markers: saved } };
-  const previous = state.items;
-  setState((current) => ({
-    ...current,
-    items: current.items.map((entry) => (entry.id === id ? next : entry)),
-  }));
-  try {
-    await putMeta(next);
-    return true;
-  } catch (error) {
-    setState((current) => ({ ...current, items: previous }));
-    pushNotice(storageErrorMessage(error, "save"));
-    return false;
-  }
+  return enqueueImageMeta(id, "vectors", (item) => {
+    const current = normalizeVectorMarkers(item.vectors) ?? [];
+    if (JSON.stringify(current) === JSON.stringify(saved)) return null;
+    return { ...item, vectors: { vibe: VECTOR_VIBE, markers: saved } };
+  });
+}
+
+/** Writes this image's effect markers. Vector markers and the picture itself stay as they are. */
+export async function saveImageEffects(id: string, markers: readonly EffectMarker[]): Promise<boolean> {
+  if (!userWritesOpen()) return false;
+  if (!state.items.some((entry) => entry.id === id)) return false;
+  const saved = normalizeEffectMarkers({ markers }) ?? [];
+  return enqueueImageMeta(id, "effects", (item) => {
+    const current = normalizeEffectMarkers(item.effects) ?? [];
+    if (JSON.stringify(current) === JSON.stringify(saved)) return null;
+    return { ...item, effects: { markers: saved } };
+  });
 }
 
 /** Writes this image's animation and voice preset. Other images, and this image's markers, stay as they are. */
 export async function saveImagePlay(id: string, play: ImagePlay): Promise<boolean> {
   if (!userWritesOpen()) return false;
-  const item = state.items.find((entry) => entry.id === id);
-  if (!item) return false;
+  if (!state.items.some((entry) => entry.id === id)) return false;
   const saved = normalizeImagePlay(play);
   if (!saved) return false;
-  const next = { ...item, play: saved };
-  const previous = state.items;
-  setState((current) => ({
-    ...current,
-    items: current.items.map((entry) => (entry.id === id ? next : entry)),
-  }));
-  try {
-    await putMeta(next);
-    return true;
-  } catch (error) {
-    setState((current) => ({ ...current, items: previous }));
-    pushNotice(storageErrorMessage(error, "save"));
-    return false;
-  }
+  return enqueueImageMeta(id, "play", (item) => {
+    if (JSON.stringify(normalizeImagePlay(item.play)) === JSON.stringify(saved)) return null;
+    return { ...item, play: saved };
+  });
+}
+
+/** Clears this image's animation and voice preset. Markers on this image stay as they are. */
+export async function clearImagePlay(id: string): Promise<boolean> {
+  if (!userWritesOpen()) return false;
+  if (!state.items.some((entry) => entry.id === id)) return false;
+  return enqueueImageMeta(id, "play", (item) => {
+    if (item.play === undefined) return null;
+    const next = { ...item };
+    delete next.play;
+    return next;
+  });
 }
 
 /** Shows or hides one image's pen layer. The drawing itself is left in place. */
@@ -847,6 +984,52 @@ export async function setInkVisible(id: string, visible: boolean): Promise<void>
   }
 }
 
+/** Remembers mosaic and color reduction for one image. Turning one off keeps its slider value. */
+const dotWrite = new Map<string, { gen: number; tail: Promise<void> }>();
+
+export async function setImageDot(id: string, dot: DotPatch): Promise<void> {
+  if (!userWritesOpen()) return;
+  const item = state.items.find((entry) => entry.id === id);
+  if (!item) return;
+  const nextDot = mergeDot(item.dot, dot);
+  if (item.dot && sameDot(item.dot, nextDot)) return;
+  const before = item.dot;
+  const next = { ...item, dot: nextDot };
+  setState((current) => ({
+    ...current,
+    items: current.items.map((entry) => (entry.id === id ? next : entry)),
+  }));
+  const slot = dotWrite.get(id) ?? { gen: 0, tail: Promise.resolve() };
+  const gen = slot.gen + 1;
+  const tail = slot.tail
+    .catch(() => undefined)
+    .then(async () => {
+      if (dotWrite.get(id)?.gen !== gen) return;
+      const latest = state.items.find((entry) => entry.id === id);
+      if (!latest) return;
+      try {
+        await putMeta(latest);
+      } catch (error) {
+        if (dotWrite.get(id)?.gen !== gen) return;
+        setState((current) => ({
+          ...current,
+          items: current.items.map((entry) => {
+            if (entry.id !== id) return entry;
+            if (before === undefined) {
+              const restored = { ...entry };
+              delete restored.dot;
+              return restored;
+            }
+            return { ...entry, dot: before };
+          }),
+        }));
+        pushNotice(storageErrorMessage(error, "save"));
+      }
+    });
+  dotWrite.set(id, { gen, tail: tail.then(() => undefined, () => undefined) });
+  await tail;
+}
+
 /** Gallery learns that a pen layer was saved or removed. Does not touch the pixels. */
 export function noteInkPresence(id: string, present: boolean): void {
   if (!id || isCanvasInkId(id)) return;
@@ -859,6 +1042,373 @@ export function noteInkPresence(id: string, present: boolean): void {
       inkRev: { ...current.inkRev, [id]: (current.inkRev[id] ?? 0) + 1 },
     };
   });
+}
+
+/** One display-state copy at a time. A second click is told to wait, not queued. */
+let displayCopyBusy = false;
+let dotCopyBusy = false;
+
+/**
+ * Still PNG of the picture as it looked when the button was pressed, plus a separate copy of its edit data.
+ * The original record is not changed. The new record is added only after the PNG and the copied edits both land.
+ */
+export async function copyDisplayState(id: string, live: DisplayCopyLive, settleInk?: () => Promise<void>): Promise<string | null> {
+  if (displayCopyBusy) {
+    notify("表示状態の複製を作成しています。");
+    return null;
+  }
+  if (viewerLock || !userWritesOpen()) return null;
+  const item = state.items.find((entry) => entry.id === id);
+  if (!item || !item.mime.startsWith("image/")) {
+    notify("この画像は複製できません。");
+    return null;
+  }
+  displayCopyBusy = true;
+  let snap: ImageMeta;
+  let liveSnap: DisplayCopyLive;
+  let edits: ClonedDisplayEdits;
+  try {
+    snap = structuredClone(item);
+    liveSnap = structuredClone(live);
+    edits = cloneDisplayEdits(snap, liveSnap);
+  } catch {
+    displayCopyBusy = false;
+    notify("表示状態を読み取れなかったため、複製を作っていません。");
+    return null;
+  }
+  const job = queue.then(() => writeDisplayCopy(snap, edits, settleInk));
+  queue = job.then(
+    () => undefined,
+    () => undefined,
+  );
+  try {
+    return await job;
+  } finally {
+    displayCopyBusy = false;
+  }
+}
+
+async function writeDisplayCopy(snap: ImageMeta, edits: ClonedDisplayEdits, settleInk?: () => Promise<void>): Promise<string | null> {
+  let photo: ImageBitmap | null = null;
+  let inkImage: ImageBitmap | null = null;
+  try {
+    if (viewerLock || !userWritesOpen()) return null;
+    if (settleInk) await settleInk();
+    if (viewerLock || !userWritesOpen()) return null;
+    const original = await readPixels(snap.id, "original");
+    if (!original) {
+      notify("元画像を読めなかったため、複製を作っていません。");
+      return null;
+    }
+    const inkBlob = await readInk(snap.id);
+    const plan = inkCopyPlan(snap.inkVisible !== false, Boolean(inkBlob && inkBlob.size > 0));
+    try {
+      photo = await createImageBitmap(original, { imageOrientation: "from-image" });
+    } catch {
+      notify("元画像を読めなかったため、複製を作っていません。");
+      return null;
+    }
+    if (photo.width < 1 || photo.height < 1) {
+      notify("元画像を読めなかったため、複製を作っていません。");
+      return null;
+    }
+    if (plan === "bake" && inkBlob) {
+      try {
+        inkImage = await createImageBitmap(inkBlob);
+      } catch {
+        notify("画像メモを読めなかったため、複製を作っていません。");
+        return null;
+      }
+    }
+    const paint = activeDot(snap.dot);
+    const view = dotView(snap.dot);
+    const recipe = dotRecipe(snap.dot);
+    const png = await composeDisplayPng({
+      image: photo,
+      width: photo.width,
+      height: photo.height,
+      dotCols: paint.cols,
+      dotColors: paint.colors,
+      recipe: view.show ? recipe : null,
+      ink: inkImage,
+    });
+    photo.close();
+    photo = null;
+    if (inkImage) {
+      inkImage.close();
+      inkImage = null;
+    }
+    let prepared;
+    try {
+      prepared = await prepareImage(png, "image/png");
+    } catch (error) {
+      if (error instanceof ImagePrepareError) {
+        notify("複製画像を作れなかったため、登録していません。");
+        return null;
+      }
+      throw error;
+    }
+    const names = state.items.filter((entry) => entry.folderId === snap.folderId).map((entry) => entry.name);
+    const name = displayCopyFileName(snap.name, names);
+    const order = nextImageOrders(snap.folderId, 1)[0] ?? 1;
+    const newId = crypto.randomUUID();
+    const meta: ImageMeta = {
+      id: newId,
+      name,
+      mime: "image/png",
+      width: prepared.width,
+      height: prepared.height,
+      byteSize: prepared.original.size,
+      addedAt: Date.now(),
+      order,
+      scale: edits.scale,
+      source: "file",
+      folderId: snap.folderId,
+      favorite: edits.favorite,
+      tagIds: [...edits.tagIds],
+      animated: false,
+      memo: edits.memo,
+      ...(plan === "keep-hidden" ? { inkVisible: false } : {}),
+      ...(edits.puru ? { puru: edits.puru } : {}),
+      ...(edits.vectors ? { vectors: edits.vectors } : {}),
+      ...(edits.effects ? { effects: edits.effects } : {}),
+      ...(edits.play ? { play: edits.play } : {}),
+    };
+    await saveImage(meta, prepared.original, prepared.thumb);
+    if (plan === "keep-hidden" && inkBlob) {
+      try {
+        const bytes = await inkBlob.arrayBuffer();
+        await saveInk(newId, new Blob([bytes], { type: "image/png" }));
+      } catch {
+        let removed = false;
+        try {
+          await deleteImage(newId);
+          removed = true;
+        } catch {
+          removed = false;
+        }
+        notify(removed ? "画像メモを複製できなかったため、複製を登録していません。" : "画像メモを複製できず、途中の画像も消せませんでした。");
+        return null;
+      }
+    }
+    publishImage(meta);
+    if (plan === "keep-hidden") noteInkPresence(newId, true);
+    notify("表示状態を複製しました。");
+    return newId;
+  } catch (error) {
+    if (error instanceof Error && (error.message === "canvas" || error.message === "png" || error instanceof ImagePrepareError)) {
+      notify("複製画像を作れなかったため、登録していません。");
+      return null;
+    }
+    notify(storageErrorMessage(error, "save"));
+    return null;
+  } finally {
+    try {
+      photo?.close();
+    } catch {
+      /* already released */
+    }
+    try {
+      inkImage?.close();
+    } catch {
+      /* already released */
+    }
+  }
+}
+
+/**
+ * File one still PNG of the current dot result into the source image's folder.
+ * The source record, its dot settings, and the open image stay as they were.
+ */
+export async function addDotStill(sourceId: string, png: Blob): Promise<string | null> {
+  if (dotCopyBusy) {
+    notify("ドットの複製を作成しています。");
+    return null;
+  }
+  if (viewerLock || !userWritesOpen()) return null;
+  const item = state.items.find((entry) => entry.id === sourceId);
+  if (!item || !item.mime.startsWith("image/")) {
+    notify("この画像のドット絵は複製できません。");
+    return null;
+  }
+  const folder = state.folders.find((entry) => entry.id === item.folderId);
+  if (!item.folderId || !folder) {
+    notify("元画像のフォルダが分からないので、別の場所には保存していません。");
+    return null;
+  }
+  if (folder.isParent) {
+    notify("親フォルダには画像を入れられないので、複製は作っていません。");
+    return null;
+  }
+  if (!png || png.size < 1) {
+    notify("ドット絵を画像にできなかったので、複製は作っていません。");
+    return null;
+  }
+  dotCopyBusy = true;
+  let snap: ImageMeta;
+  try {
+    snap = structuredClone(item);
+  } catch {
+    dotCopyBusy = false;
+    notify("元画像を読み取れなかったので、複製は作っていません。");
+    return null;
+  }
+  const job = queue.then(() => writeDotStill(snap, png));
+  queue = job.then(
+    () => undefined,
+    () => undefined,
+  );
+  try {
+    return await job;
+  } finally {
+    dotCopyBusy = false;
+  }
+}
+
+async function writeDotStill(snap: ImageMeta, png: Blob): Promise<string | null> {
+  try {
+    if (viewerLock || !userWritesOpen()) return null;
+    const folder = state.folders.find((entry) => entry.id === snap.folderId);
+    if (!snap.folderId || !folder) {
+      notify("元画像のフォルダが分からないので、別の場所には保存していません。");
+      return null;
+    }
+    if (folder.isParent) {
+      notify("親フォルダには画像を入れられないので、複製は作っていません。");
+      return null;
+    }
+    let prepared;
+    try {
+      prepared = await prepareImage(png, "image/png");
+    } catch (error) {
+      if (error instanceof ImagePrepareError) {
+        notify("ドット絵を登録できなかったので、複製は作っていません。");
+        return null;
+      }
+      throw error;
+    }
+    const names = state.items.filter((entry) => entry.folderId === snap.folderId).map((entry) => entry.name);
+    const name = dotCopyFileName(snap.name, names);
+    const order = nextImageOrders(snap.folderId, 1)[0] ?? 1;
+    const newId = crypto.randomUUID();
+    const meta: ImageMeta = {
+      id: newId,
+      name,
+      mime: "image/png",
+      width: prepared.width,
+      height: prepared.height,
+      byteSize: prepared.original.size,
+      addedAt: Date.now(),
+      order,
+      scale: 1,
+      source: "file",
+      folderId: snap.folderId,
+      favorite: false,
+      tagIds: [],
+      animated: false,
+      memo: "",
+    };
+    await saveImage(meta, prepared.original, prepared.thumb);
+    publishImage(meta);
+    notify("ドット絵を同じフォルダに複製しました。元の画像はそのままです。");
+    return newId;
+  } catch (error) {
+    notify(storageErrorMessage(error, "save"));
+    return null;
+  }
+}
+
+let pixelExportBusy = false;
+
+/**
+ * File a scaled still of the pixel canvas into a folder.
+ * The canvas, its history, and the source image are not changed.
+ * A known source image uses that image's folder. Otherwise the open folder is used.
+ */
+export async function addPixelScaled(input: { png: Blob; sourceId: string | null; baseName: string; scale: number }): Promise<string | null> {
+  if (pixelExportBusy) {
+    notify("拡大画像を追加しています。");
+    return null;
+  }
+  if (viewerLock || !userWritesOpen()) return null;
+  if (!input.png || input.png.size < 1 || !Number.isInteger(input.scale) || input.scale < 1) {
+    notify("拡大画像を作れなかったので、フォルダには追加していません。");
+    return null;
+  }
+  pixelExportBusy = true;
+  const job = queue.then(() => writePixelScaled(input));
+  queue = job.then(
+    () => undefined,
+    () => undefined,
+  );
+  try {
+    return await job;
+  } finally {
+    pixelExportBusy = false;
+  }
+}
+
+async function writePixelScaled(input: { png: Blob; sourceId: string | null; baseName: string; scale: number }): Promise<string | null> {
+  try {
+    if (viewerLock || !userWritesOpen()) return null;
+    let folderId = "";
+    let baseName = input.baseName.trim() || "pixel";
+    if (input.sourceId) {
+      const item = state.items.find((entry) => entry.id === input.sourceId);
+      if (item?.folderId) {
+        folderId = item.folderId;
+        if (item.name.trim()) baseName = item.name;
+      }
+    }
+    if (!folderId) folderId = inboxFolderId();
+    const folder = state.folders.find((entry) => entry.id === folderId);
+    if (!folder) {
+      notify("追加先のフォルダが分からないので、画像は追加していません。");
+      return null;
+    }
+    if (folder.isParent) {
+      notify("親フォルダには画像を入れられないので、追加していません。");
+      return null;
+    }
+    let prepared;
+    try {
+      prepared = await prepareImage(input.png, "image/png");
+    } catch (error) {
+      if (error instanceof ImagePrepareError) {
+        notify("拡大画像を登録できなかったので、フォルダには追加していません。");
+        return null;
+      }
+      throw error;
+    }
+    const names = state.items.filter((entry) => entry.folderId === folderId).map((entry) => entry.name);
+    const name = pixelExportFileName(baseName, input.scale, names);
+    const order = nextImageOrders(folderId, 1)[0] ?? 1;
+    const newId = crypto.randomUUID();
+    const meta: ImageMeta = {
+      id: newId,
+      name,
+      mime: "image/png",
+      width: prepared.width,
+      height: prepared.height,
+      byteSize: prepared.original.size,
+      addedAt: Date.now(),
+      order,
+      scale: 1,
+      source: "file",
+      folderId,
+      favorite: false,
+      tagIds: [],
+      animated: false,
+      memo: "",
+    };
+    await saveImage(meta, prepared.original, prepared.thumb);
+    publishImage(meta);
+    notify(`「${name}」をフォルダに追加しました。編集中のキャンバスはそのままです。`);
+    return newId;
+  } catch (error) {
+    notify(storageErrorMessage(error, "save"));
+    return null;
+  }
 }
 
 function tagTaken(name: string, exceptId?: string): boolean {
@@ -1987,6 +2537,20 @@ export async function saveCssFx(on: boolean): Promise<void> {
     await writeKv("cssFx", on ? 1 : 0);
   } catch (error) {
     setState((current) => ({ ...current, cssFx: !on }));
+    pushNotice(storageErrorMessage(error, "save"));
+  }
+}
+
+export async function saveGalleryPlate(plate: GalleryPlate): Promise<void> {
+  if (!userWritesOpen()) return;
+  const next = galleryPlateOf(plate);
+  const previous = state.galleryPlate;
+  if (next === previous) return;
+  setState((current) => ({ ...current, galleryPlate: next }));
+  try {
+    await writeKv("galleryPlate", next);
+  } catch (error) {
+    setState((current) => ({ ...current, galleryPlate: previous }));
     pushNotice(storageErrorMessage(error, "save"));
   }
 }

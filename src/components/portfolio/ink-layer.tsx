@@ -147,6 +147,14 @@ export function forgetPersistedInk(id: string): Promise<void> {
   return run;
 }
 
+/** Waits for a pen save that already started. Does not read or write pixels. */
+export function settledInk(id: string): Promise<void> {
+  return (inkTail.get(id) ?? Promise.resolve()).then(
+    () => undefined,
+    () => undefined,
+  );
+}
+
 export type CanvasInkApi = {
   snapshot: () => InkSnap | null;
   restore: (next: InkSnap) => void;

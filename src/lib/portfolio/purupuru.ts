@@ -12,6 +12,8 @@ export type PuruMarker = {
   radius: number;
   /** Drawn size relative to the radius. 1 is the full circle, 0.5 is half. Missing means 1. */
   view?: number;
+  /** Parked. Missing means the marker still deforms. */
+  off?: boolean;
 };
 
 export type PuruBody = {
@@ -148,6 +150,11 @@ export function markerView(marker: Pick<PuruMarker, "view">): number {
   return clampView(marker.view ?? 1);
 }
 
+/** True only when this marker was parked. Older saves have no flag and stay active. */
+export function markerOff(marker: { off?: boolean } | null | undefined): boolean {
+  return marker?.off === true;
+}
+
 export function normalizePuruMarkers(raw: unknown): PuruMarker[] | null {
   if (!raw || typeof raw !== "object") return null;
   const markers = (raw as { markers?: unknown }).markers;
@@ -156,7 +163,7 @@ export function normalizePuruMarkers(raw: unknown): PuruMarker[] | null {
   const seen = new Set<number>();
   for (const entry of markers) {
     if (!entry || typeof entry !== "object") continue;
-    const row = entry as { id?: unknown; kind?: unknown; u?: unknown; v?: unknown; radius?: unknown; view?: unknown };
+    const row = entry as { id?: unknown; kind?: unknown; u?: unknown; v?: unknown; radius?: unknown; view?: unknown; off?: unknown };
     if (typeof row.id !== "number" || !Number.isFinite(row.id) || seen.has(row.id)) continue;
     if (typeof row.kind !== "string" || !KIND_IDS.has(row.kind)) continue;
     if (typeof row.u !== "number" || typeof row.v !== "number" || typeof row.radius !== "number") continue;
@@ -170,6 +177,7 @@ export function normalizePuruMarkers(raw: unknown): PuruMarker[] | null {
       radius: clampRadius(row.radius),
     };
     if (typeof row.view === "number" && Number.isFinite(row.view)) marker.view = clampView(row.view);
+    if (row.off === true) marker.off = true;
     out.push(marker);
   }
   return out;
@@ -421,6 +429,12 @@ export function stepBodies(markers: PuruMarker[], bodies: Map<number, PuruBody>,
   const next: PuruBody[] = [];
   for (const marker of markers) {
     live.add(marker.id);
+    if (markerOff(marker)) {
+      const parked = restBody();
+      bodies.set(marker.id, parked);
+      next.push(parked);
+      continue;
+    }
     const stepped = stepBody(bodies.get(marker.id) ?? restBody(), marker.kind, drive, dt, space);
     bodies.set(marker.id, stepped);
     next.push(stepped);
@@ -475,7 +489,7 @@ export function sampleShift(
   for (let i = 0; i < markers.length; i++) {
     const marker = markers[i];
     const body = bodies[i];
-    if (!marker || !body) continue;
+    if (!marker || !body || markerOff(marker)) continue;
     const mx = marker.u * width;
     const my = marker.v * height;
     const drawn = Math.max(1, markerDrawnRadius(marker, minSide));
@@ -509,7 +523,7 @@ export function sampleShift(
 
 /** Strongest deformable marker here. Pins and empty space are 0, so nothing invents a mesh. */
 export function puruDeformWeight(
-  markers: readonly Pick<PuruMarker, "kind" | "u" | "v" | "radius" | "view">[],
+  markers: readonly Pick<PuruMarker, "kind" | "u" | "v" | "radius" | "view" | "off">[],
   x: number,
   y: number,
   width: number,
@@ -519,7 +533,7 @@ export function puruDeformWeight(
   const minSide = Math.min(width, height);
   let weight = 0;
   for (const marker of markers) {
-    if (marker.kind === "still") continue;
+    if (marker.kind === "still" || markerOff(marker)) continue;
     const drawn = marker.radius * markerView(marker) * minSide;
     if (!(drawn > 0)) continue;
     const next = influence(Math.hypot(x - marker.u * width, y - marker.v * height), drawn, marker.kind);
@@ -586,7 +600,7 @@ export function stillHold(markers: readonly PuruMarker[], x: number, y: number, 
   const minSide = Math.min(width, height);
   let hold = 0;
   for (const marker of markers) {
-    if (marker.kind !== "still") continue;
+    if (marker.kind !== "still" || markerOff(marker)) continue;
     const drawn = markerDrawnRadius(marker, minSide);
     if (!(drawn > 0)) continue;
     const weight = influence(Math.hypot(x - marker.u * width, y - marker.v * height), drawn, marker.kind);
@@ -624,7 +638,7 @@ export function viewShift(
   let gain = 0.28;
   let sum = 0;
   for (const marker of markers) {
-    if (marker.kind === "still") continue;
+    if (marker.kind === "still" || markerOff(marker)) continue;
     const drawn = Math.max(1, markerDrawnRadius(marker, minSide));
     const weight = influence(Math.hypot(x - marker.u * width, y - marker.v * height), drawn, marker.kind);
     sum += weight * (TUNE[marker.kind].gain / FIRM_TUNE.gain);

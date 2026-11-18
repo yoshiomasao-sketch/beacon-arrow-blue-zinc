@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { animationCycle, animationFrame, animationPose, animPhase, buzzWindow, carryForPhase, hitUnit, twistCycle, TWIST_DEG, ULTRA_HIT_CONTACT, zoomOptionCycle, type AnimKind, type AnimSpeed } from "./image-animation.ts";
+import { favoriteRecordMs, vectorCycle } from "./vector-marker.ts";
 
 const frame = { width: 400, height: 700 };
 const kinds: AnimKind[] = ["swayX", "hitX", "swayY", "hitY", "orbit", "zoom", "buzz"];
@@ -52,17 +53,24 @@ describe("image animation", () => {
     }
     const fastPull = animationCycle("hitX", "fast") * 0.64;
     const rapidPull = animationCycle("hitX", "rapid") * 0.64;
-    assert.ok(rapidPull < fastPull * 0.7);
+    assert.ok(Math.abs(rapidPull / fastPull - 2 / 3) < 1e-9);
     assert.ok(animationCycle("hitX", "ultra") < animationCycle("hitX", "rapid"));
     assert.ok(Math.abs(animationPose("hitX", "ultra", 0, frame).x) > Math.abs(animationPose("hitX", "fast", 0, frame).x));
   });
 
-  it("speeds orbit and zoom up harder than a shared ratio", () => {
-    const ratio = (kind: AnimKind) => animationCycle(kind, "ultra") / animationCycle(kind, "fast");
-    assert.ok(ratio("orbit") < ratio("swayX"));
-    assert.ok(Math.abs(ratio("zoom") - 0.13 / 0.55) < 1e-9);
-    assert.ok(animationCycle("orbit", "ultra") < animationCycle("orbit", "rapid"));
+  it("gives sway, hit, and orbit one clock, and leaves zoom on its own ratio", () => {
+    const shared = (speed: AnimSpeed) => animationCycle("swayX", speed);
+    for (const speed of speeds) {
+      assert.equal(animationCycle("swayY", speed), shared(speed));
+      assert.equal(animationCycle("hitX", speed), shared(speed));
+      assert.equal(animationCycle("hitY", speed), shared(speed));
+      assert.equal(animationCycle("orbit", speed), shared(speed));
+    }
+    assert.equal(shared("ultra") / shared("fast"), 0.5);
+    const zoomRatio = animationCycle("zoom", "ultra") / animationCycle("zoom", "fast");
+    assert.equal(zoomRatio, 0.25);
     assert.ok(animationCycle("zoom", "rapid") < animationCycle("zoom", "fast"));
+    assert.ok(animationCycle("zoom", "ultra") < animationCycle("zoom", "rapid"));
   });
 
   it("loops sway, orbit, and zoom without a jump", () => {
@@ -95,35 +103,40 @@ describe("image animation", () => {
     }
   });
 
-  it("steps sway, hit, and orbit up one speed and keeps the old swing size", () => {
-    assert.equal(animationCycle("swayX", "slow"), 3400);
-    assert.equal(animationCycle("swayX", "normal"), 3400 * 0.58);
-    assert.equal(animationCycle("swayX", "fast"), 3400 * 0.34);
-    assert.equal(animationCycle("swayX", "rapid"), 3400 * 0.2);
-    assert.equal(animationCycle("swayX", "ultra"), 3400 * 0.08);
-    assert.ok(animationCycle("swayX", "ultra") < animationCycle("swayX", "rapid"));
-    assert.ok(animationCycle("swayX", "ultra") > animationCycle("swayX", "rapid") * 0.3);
+  it("times sway, hit, and orbit from 打ち付け・遅 and keeps the old swing size", () => {
+    const t = vectorCycle("hit", "slow");
+    assert.equal(t, 2560);
+    assert.equal(animationCycle("swayX", "slow"), t / 0.5);
+    assert.equal(animationCycle("swayX", "normal"), t);
+    assert.equal(animationCycle("swayX", "fast"), t / 2);
+    assert.equal(animationCycle("swayX", "rapid"), t / 3);
+    assert.equal(animationCycle("swayX", "ultra"), t / 4);
     assert.equal(animationCycle("swayY", "slow"), animationCycle("swayX", "slow"));
-    assert.equal(animationCycle("hitX", "slow"), 2800);
-    assert.equal(animationCycle("hitX", "rapid"), 2800 * 0.2);
-    assert.equal(animationCycle("hitX", "ultra"), 72 + 44 + 84 + 192);
+    assert.equal(animationCycle("hitX", "slow"), animationCycle("swayX", "slow"));
+    assert.equal(animationCycle("hitX", "rapid"), animationCycle("swayX", "rapid"));
+    assert.equal(animationCycle("hitX", "ultra"), animationCycle("orbit", "ultra"));
     assert.equal(animationCycle("hitY", "ultra"), animationCycle("hitX", "ultra"));
-    assert.equal(animationCycle("orbit", "slow"), 7600);
-    assert.equal(animationCycle("orbit", "rapid"), 7600 * 0.075);
-    assert.ok(Math.abs(animationCycle("orbit", "ultra") - 7600 * 0.029032258) < 0.05);
+    const { pull, slam, stop, buzz } = ULTRA_HIT_CONTACT;
+    assert.equal(pull + slam + stop + buzz, animationCycle("hitX", "ultra"));
+    assert.ok(Math.abs(pull / slam - 72 / 44) < 1e-9);
+    assert.ok(Math.abs(stop / buzz - 84 / 192) < 1e-6 || Math.abs(stop / (animationCycle("hitX", "ultra") - pull - slam - stop) - 84 / 192) < 1e-6);
     const amp = (kind: "swayX" | "orbit", speed: AnimSpeed) => {
       const cycle = animationCycle(kind, speed);
       const pose = animationPose(kind, speed, cycle * 0.25, frame);
       return kind === "swayX" ? Math.abs(pose.x) : Math.abs(pose.y);
     };
     assert.ok(Math.abs(amp("swayX", "slow") - 400 * 0.042) < 0.05);
+    assert.ok(Math.abs(amp("swayX", "normal") - 400 * 0.042 * 1.05) < 0.05);
     assert.ok(Math.abs(amp("swayX", "ultra") - amp("swayX", "rapid")) < 0.05);
+    assert.ok(Math.abs(amp("orbit", "slow") - 400 * 0.032) < 0.05);
     assert.ok(Math.abs(amp("orbit", "ultra") - amp("orbit", "rapid")) < 0.05);
-    assert.equal(animationCycle("zoom", "slow"), 5200 * 1.65);
-    assert.equal(animationCycle("zoom", "normal"), 5200);
-    assert.equal(animationCycle("zoom", "ultra"), 5200 * 0.13);
-    assert.equal(animationCycle("buzz", "slow"), 1700 + 360);
-    assert.equal(animationCycle("buzz", "ultra"), 130 + 110);
+    assert.ok(Math.abs(animationPose("hitX", "slow", 0, frame).x - 400 * 0.05) < 0.05);
+    assert.ok(Math.abs(animationPose("hitX", "fast", 0, frame).x - 400 * 0.05 * 1.32) < 0.05);
+    assert.equal(animationCycle("zoom", "slow"), favoriteRecordMs());
+    assert.equal(animationCycle("zoom", "normal"), favoriteRecordMs() / 2);
+    assert.equal(animationCycle("zoom", "ultra"), favoriteRecordMs() / 16);
+    assert.equal(animationCycle("buzz", "slow"), favoriteRecordMs() / 3);
+    assert.equal(animationCycle("buzz", "ultra"), favoriteRecordMs() / 20);
   });
 
   it("reverses direction without changing the speed or the buzz timing", () => {
@@ -249,7 +262,7 @@ describe("image animation", () => {
 
     const sway = animationPose("swayX", "ultra", animationCycle("swayX", "ultra") * 0.25, frame);
     assert.equal(sway.y, 0);
-    assert.equal(animationCycle("swayX", "ultra"), 3400 * 0.08);
+    assert.equal(animationCycle("swayX", "ultra"), vectorCycle("hit", "slow") / 4);
   });
 
   it("rests, then buzzes, and gets harsher without using one shared ratio", () => {
@@ -324,7 +337,7 @@ describe("image animation", () => {
     }
 
     const twist = twistCycle();
-    assert.equal(twist, 12800);
+    assert.equal(twist, favoriteRecordMs() / 2);
     assert.equal(TWIST_DEG, 15);
     assert.equal(animationFrame("orbit", "ultra", 0, frame, false, { twist: true }).rotate, 0);
     for (const speed of speeds) {
@@ -381,7 +394,8 @@ describe("image animation", () => {
     const mixed = animationFrame("swayX", "fast", twist * 0.25, frame, true, { zoom: true, twist: true, tilt: "left" });
     assert.ok(Math.abs(mixed.rotate + TWIST_DEG) < 0.001);
     assert.ok(mixed.scale > 1);
-    assert.ok(Math.hypot(mixed.x, mixed.y) > 1);
+    const swaying = animationFrame("swayX", "fast", animationCycle("swayX", "fast") * 0.25, frame, true, { zoom: true, twist: true, tilt: "left" });
+    assert.ok(Math.hypot(swaying.x, swaying.y) > 1);
     const cleared = animationFrame("swayX", "fast", twist * 0.25, frame, true);
     assert.equal(cleared.rotate, 0);
     assert.ok(Math.abs(cleared.y) < 0.001);
@@ -400,7 +414,7 @@ describe("image animation", () => {
     const normalZoom = zoomOptionCycle();
     const normalTwist = twistCycle();
     assert.equal(normalZoom, animationCycle("zoom", "fast") * 2);
-    assert.equal(normalTwist, 12800);
+    assert.equal(normalTwist, favoriteRecordMs() / 2);
     assert.equal(zoomOptionCycle("slow"), normalZoom * 2);
     assert.equal(zoomOptionCycle("fast"), normalZoom * 0.5);
     assert.equal(twistCycle("slow"), normalTwist * 2);

@@ -4,12 +4,12 @@ declare module "gifenc/dist/gifenc.esm.js" {
       index: Uint8Array,
       width: number,
       height: number,
-      opts?: { palette?: number[][]; delay?: number; repeat?: number; dispose?: number },
+      opts?: { palette?: number[][]; delay?: number; repeat?: number; dispose?: number; transparent?: boolean; transparentIndex?: number },
     ): void;
     finish(): void;
     bytes(): Uint8Array;
   };
-  export function quantize(rgba: Uint8Array, maxColors: number): number[][];
+  export function quantize(rgba: Uint8Array, maxColors: number, options?: { format?: "rgb565" | "rgb444" | "rgba4444" }): number[][];
   export function applyPalette(rgba: Uint8Array, palette: number[][]): Uint8Array;
 }
 

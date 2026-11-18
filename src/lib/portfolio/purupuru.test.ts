@@ -31,7 +31,9 @@ import {
   viewAtRim,
   restBody,
   sampleShift,
+  stepBodies,
   stepBody,
+  stillHold,
   stepHits,
   puruMotionSpace,
   PURU_MOTION_REF,
@@ -364,6 +366,36 @@ describe("purupuru", () => {
     assert.equal(puruKindFace("still", false).short, "不動");
     assert.equal(puruKindFace("still").hint, "円の少し外側まで、動きを抑える");
     assert.equal(PURU_KINDS.some((kind) => kind.id === "still"), false);
+  });
+
+  it("parks a puru marker without moving the others or dropping its settings", () => {
+    const live: PuruMarker = { id: 1, kind: "mid", u: 0.5, v: 0.5, radius: 0.25 };
+    const parked: PuruMarker = { id: 2, kind: "mid", u: 0.2, v: 0.5, radius: 0.25, off: true };
+    const body = [{ ...restBody(), ox: 20 }, { ...restBody(), ox: 20 }];
+    const mixed = sampleShift([live, parked], body, 200, 200, 400, 400);
+    const alone = sampleShift([live], [body[0]!], 200, 200, 400, 400);
+    assert.ok(Math.abs(mixed.x - alone.x) < 0.001);
+    assert.equal(sampleShift([parked], [body[1]!], 80, 200, 400, 400).x, 0);
+    const pin: PuruMarker = { id: 3, kind: "still", u: 0.5, v: 0.5, radius: 0.4, off: true };
+    assert.equal(stillHold([pin], 200, 200, 400, 400), 0);
+    assert.ok(stillHold([{ ...pin, off: undefined }], 200, 200, 400, 400) > 0.8);
+    const drive = { vx: 500, vy: 0, dScale: 0 };
+    const bodies = new Map();
+    let posed = stepBodies([live, parked], bodies, drive, 1 / 60);
+    for (let i = 0; i < 40; i += 1) posed = stepBodies([live, parked], bodies, drive, 1 / 60);
+    assert.ok(Math.abs(posed[0]!.ox) > 0.5);
+    assert.equal(posed[1]!.ox, 0);
+    assert.equal(posed[1]!.vx, 0);
+    const saved = normalizePuruMarkers({
+      markers: [live, parked, { id: 4, kind: "soft", u: 0.7, v: 0.3, radius: 0.22, off: false }],
+    });
+    assert.equal(saved?.[0]?.off, undefined);
+    assert.equal(saved?.[1]?.off, true);
+    assert.equal(saved?.[1]?.kind, "mid");
+    assert.equal(saved?.[1]?.u, 0.2);
+    assert.equal(saved?.[1]?.radius, 0.25);
+    assert.equal(saved?.[2]?.off, undefined);
+    assert.equal(saved?.[2]?.kind, "soft");
   });
 });
 

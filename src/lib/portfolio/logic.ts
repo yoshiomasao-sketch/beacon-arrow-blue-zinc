@@ -1,7 +1,10 @@
-import { ALL_FOLDERS, DEFAULT_FOLDER_VIEW, SUPPORTED_MIMES, TAG_COLORS, type DisplayScale, type Folder, type FolderView, type ImageMeta, type ImageSource, type SupportedMime, type Tag, type TagFolder } from "./types.ts";
+import { ALL_FOLDERS, DEFAULT_FOLDER_VIEW, SUPPORTED_MIMES, TAG_COLORS, type DisplayScale, type Folder, type FolderView, type ImageDot, type ImageMeta, type ImageSource, type SupportedMime, type Tag, type TagFolder } from "./types.ts";
 import { normalizePuruMarkers } from "./purupuru.ts";
-import { normalizeVectorMarkers } from "./vector-marker.ts";
+import { normalizeVectorMarkers, VECTOR_VIBE } from "./vector-marker.ts";
 import { normalizeImagePlay } from "./image-play.ts";
+import { dotView } from "./dot-filter.ts";
+import { storedDotExtras } from "./dot-recipe.ts";
+import { normalizeEffectMarkers } from "./effect-marker.ts";
 
 export type ImageCandidate = {
   name: string;
@@ -48,6 +51,25 @@ export function classifyImageInput(file: ImageCandidate): ClassifyResult {
 
 export function sortByOrder<T extends { order: number; addedAt: number }>(items: T[]): T[] {
   return items.slice().sort((a, b) => a.order - b.order || a.addedAt - b.addedAt);
+}
+
+/**
+ * Order numbers for a new batch so it sits at the front of this folder's current list.
+ * Index 0 is the first selected file and is shown first. Existing numbers are left alone.
+ * An empty folder starts at 1. Descending lists show higher numbers first, so the first file gets the highest new number.
+ */
+export function ordersAtFront(existingOrders: readonly number[], count: number, direction: "asc" | "desc"): number[] {
+  if (count <= 0) return [];
+  const finite = existingOrders.filter((order) => Number.isFinite(order));
+  if (finite.length === 0) {
+    return Array.from({ length: count }, (_, index) => (direction === "desc" ? count - index : index + 1));
+  }
+  if (direction === "desc") {
+    const max = Math.max(...finite);
+    return Array.from({ length: count }, (_, index) => max + count - index);
+  }
+  const start = Math.min(...finite) - count;
+  return Array.from({ length: count }, (_, index) => start + index);
 }
 
 /** Screen, lightbox, and PDF share this list. Stored order stays oldest-first. */
@@ -140,7 +162,9 @@ export function normalizeMeta(raw: unknown): ImageMeta | null {
     row.source === "clipboard" || row.source === "capture" ? row.source : "file";
   const puruMarkers = normalizePuruMarkers(row.puru);
   const vectorMarkers = normalizeVectorMarkers(row.vectors);
+  const effectMarkers = normalizeEffectMarkers(row.effects);
   const play = normalizeImagePlay(row.play);
+  const dot = normalizeDot(row.dot);
   return {
     id: row.id,
     name: typeof row.name === "string" && row.name ? row.name : "無題",
@@ -160,8 +184,10 @@ export function normalizeMeta(raw: unknown): ImageMeta | null {
     animated: row.animated === true,
     memo: normalizeMemo(row.memo),
     inkVisible: row.inkVisible === false ? false : true,
+    ...(dot ? { dot } : {}),
     ...(puruMarkers !== null ? { puru: { markers: puruMarkers } } : {}),
-    ...(vectorMarkers !== null ? { vectors: { markers: vectorMarkers } } : {}),
+    ...(vectorMarkers !== null ? { vectors: { vibe: VECTOR_VIBE, markers: vectorMarkers } } : {}),
+    ...(effectMarkers !== null ? { effects: { markers: effectMarkers } } : {}),
     ...(play ? { play } : {}),
   };
 }
@@ -169,6 +195,27 @@ export function normalizeMeta(raw: unknown): ImageMeta | null {
 export function normalizeMemo(value: unknown): string {
   if (typeof value !== "string") return "";
   return value.replace(/[\r\n\t]+/g, " ").replace(/ {2,}/g, " ").trim().slice(0, 100);
+}
+
+function normalizeDot(raw: unknown): ImageDot | null {
+  if (!raw || typeof raw !== "object") return null;
+  const row = raw as { show?: unknown; on?: unknown; cols?: unknown; colors?: unknown; colorOn?: unknown };
+  const view = dotView({
+    show: typeof row.show === "boolean" ? row.show : undefined,
+    on: typeof row.on === "boolean" ? row.on : undefined,
+    cols: typeof row.cols === "number" ? row.cols : undefined,
+    colors: typeof row.colors === "number" ? row.colors : undefined,
+    colorOn: typeof row.colorOn === "boolean" ? row.colorOn : undefined,
+  });
+  const base: ImageDot = {
+    show: view.show,
+    on: view.mosaic,
+    cols: view.cols,
+    colors: view.colors,
+    colorOn: view.colorOn,
+  };
+  const extra = storedDotExtras(raw);
+  return extra ? { ...base, ...extra } : base;
 }
 
 /** Empty text cancels a new note and clears one that already existed. */

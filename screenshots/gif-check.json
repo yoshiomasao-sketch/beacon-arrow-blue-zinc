@@ -1,0 +1,140 @@
+{
+  "chrome": "156.0.8078.4",
+  "decoded": [
+    {
+      "i": 0,
+      "bad": 0,
+      "pixels": 21600,
+      "w": 180,
+      "h": 120,
+      "ours": [
+        180,
+        120
+      ],
+      "first": null
+    },
+    {
+      "i": 1,
+      "bad": 0,
+      "pixels": 21600,
+      "w": 180,
+      "h": 120,
+      "ours": [
+        180,
+        120
+      ],
+      "first": null
+    }
+  ],
+  "exported": {
+    "off": {
+      "bytes": 6657,
+      "n": 32,
+      "first": {
+        "w": 80,
+        "h": 40,
+        "fw": 80,
+        "fh": 40,
+        "delay": 160,
+        "clear": 1600,
+        "opaque": 1600,
+        "colors": 1
+      },
+      "last": {
+        "w": 80,
+        "h": 40,
+        "fw": 80,
+        "fh": 40,
+        "delay": 160,
+        "clear": 1560,
+        "opaque": 1640,
+        "colors": 1
+      },
+      "delaySum": 5120
+    },
+    "on": {
+      "bytes": 2049,
+      "n": 32,
+      "first": {
+        "w": 16,
+        "h": 8,
+        "fw": 16,
+        "fh": 8,
+        "delay": 160,
+        "clear": 64,
+        "opaque": 64,
+        "colors": 1
+      },
+      "last": {
+        "w": 16,
+        "h": 8,
+        "fw": 16,
+        "fh": 8,
+        "delay": 160,
+        "clear": 56,
+        "opaque": 72,
+        "colors": 1
+      },
+      "delaySum": 5120,
+      "sizes": [
+        "16x8"
+      ]
+    }
+  },
+  "sameAfter": null,
+  "iframeAfter": {
+    "name": "drop",
+    "types": [
+      "text/plain"
+    ],
+    "file": null,
+    "download": ""
+  },
+  "log": [
+    {
+      "event": "start",
+      "types": [
+        "text/plain",
+        "downloadurl",
+        "Files"
+      ],
+      "files": [
+        {
+          "name": "GIF_Frame_001.png",
+          "type": "image/png",
+          "size": 113
+        }
+      ]
+    },
+    {
+      "event": "start",
+      "types": [
+        "text/plain",
+        "downloadurl",
+        "Files"
+      ],
+      "files": [
+        {
+          "name": "GIF_Frame_001.png",
+          "type": "image/png",
+          "size": 113
+        }
+      ]
+    },
+    {
+      "event": "start",
+      "types": [
+        "text/plain",
+        "downloadurl",
+        "Files"
+      ],
+      "files": [
+        {
+          "name": "GIF_Frame_001.png",
+          "type": "image/png",
+          "size": 113
+        }
+      ]
+    }
+  ]
+}

@@ -19,7 +19,7 @@ describe("app version", () => {
   });
 
   it("shows the current release in 詳細", () => {
-    assert.equal(APP_VERSION, "Ver.2611112205");
-    assert.equal(APP_UPDATED_LABEL, "2026年11月11日 22時05分");
+    assert.equal(APP_VERSION, "Ver.2611180346");
+    assert.equal(APP_UPDATED_LABEL, "2026年11月18日 03時46分");
   });
 });

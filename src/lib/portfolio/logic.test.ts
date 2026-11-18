@@ -46,6 +46,7 @@ import {
   normalizeTag,
   parseActiveTagIds,
   sortByOrder,
+  ordersAtFront,
   scrollTopForCenter,
   statusLabel,
   storageErrorMessage,
@@ -263,6 +264,32 @@ describe("sortByOrder", () => {
   });
 });
 
+describe("ordersAtFront", () => {
+  it("inserts the batch at the front in file order and does not touch existing numbers", () => {
+    assert.deepEqual(ordersAtFront([10, 20, 30], 2, "asc"), [8, 9]);
+    assert.deepEqual(ordersAtFront([10, 20, 30], 2, "desc"), [32, 31]);
+    assert.deepEqual(ordersAtFront([], 3, "asc"), [1, 2, 3]);
+    assert.deepEqual(ordersAtFront([], 3, "desc"), [3, 2, 1]);
+    assert.deepEqual(ordersAtFront([1, 1, 4], 2, "asc"), [-1, 0]);
+    const asc = [
+      ...[8, 9].map((order, index) => ({ id: `new-${index}`, order, addedAt: 100 + index })),
+      ...[10, 20, 30].map((order, index) => ({ id: `old-${index}`, order, addedAt: index })),
+    ];
+    const desc = [
+      ...[32, 31].map((order, index) => ({ id: `new-${index}`, order, addedAt: 100 + index })),
+      ...[10, 20, 30].map((order, index) => ({ id: `old-${index}`, order, addedAt: index })),
+    ];
+    assert.deepEqual(readingSequence(asc, "asc").map((item) => item.id), ["new-0", "new-1", "old-0", "old-1", "old-2"]);
+    assert.deepEqual(readingSequence(desc, "desc").map((item) => item.id), ["new-0", "new-1", "old-2", "old-1", "old-0"]);
+    assert.deepEqual(
+      readingSequence(desc, "desc")
+        .filter((item) => item.id.startsWith("old"))
+        .map((item) => item.id),
+      ["old-2", "old-1", "old-0"],
+    );
+  });
+});
+
 describe("importNotice", () => {
   it("stays quiet when everything was saved", () => {
     assert.equal(
@@ -354,6 +381,86 @@ describe("normalizeMeta", () => {
       })?.inkVisible,
       false,
     );
+    assert.equal(normalizeMeta({ id: "a", mime: "image/png" })?.dot, undefined);
+    assert.deepEqual(normalizeMeta({ id: "a", mime: "image/png", dot: { on: false, cols: 12 } })?.dot, {
+      show: false,
+      on: false,
+      cols: 16,
+      colors: 512,
+      colorOn: true,
+    });
+    assert.deepEqual(normalizeMeta({ id: "a", mime: "image/png", dot: { on: true } })?.dot, {
+      show: true,
+      on: true,
+      cols: 256,
+      colors: 512,
+      colorOn: true,
+    });
+    assert.deepEqual(normalizeMeta({ id: "a", mime: "image/png", dot: { on: false, cols: 64, colors: 256 } })?.dot, {
+      show: false,
+      on: false,
+      cols: 64,
+      colors: 256,
+      colorOn: true,
+    });
+    assert.deepEqual(normalizeMeta({ id: "a", mime: "image/png", dot: { on: false, cols: 64, colors: 256, colorOn: false } })?.dot, {
+      show: false,
+      on: false,
+      cols: 64,
+      colors: 256,
+      colorOn: false,
+    });
+    assert.deepEqual(normalizeMeta({ id: "a", mime: "image/png", dot: { show: false, on: true, cols: 80, colors: 128, colorOn: true } })?.dot, {
+      show: false,
+      on: true,
+      cols: 80,
+      colors: 128,
+      colorOn: true,
+    });
+    assert.deepEqual(normalizeMeta({ id: "a", mime: "image/png", dot: { on: true, cols: 8, colors: 600, colorOn: true } })?.dot, {
+      show: true,
+      on: true,
+      cols: 16,
+      colors: 512,
+      colorOn: true,
+    });
+    assert.deepEqual(normalizeMeta({ id: "a", mime: "image/png", dot: { on: true, cols: 999, colors: 12 } })?.dot, {
+      show: true,
+      on: true,
+      cols: 256,
+      colors: 12,
+      colorOn: true,
+    });
+    assert.deepEqual(normalizeMeta({ id: "a", mime: "image/png", dot: { on: true, cols: 64, colors: 4 } })?.dot, {
+      show: true,
+      on: true,
+      cols: 64,
+      colors: 4,
+      colorOn: true,
+    });
+    assert.deepEqual(normalizeMeta({ id: "a", mime: "image/png", dot: { on: true, cols: 48, colors: 24, colorOn: true } })?.dot, {
+      show: true,
+      on: true,
+      cols: 48,
+      colors: 32,
+      colorOn: true,
+    });
+    assert.equal(
+      normalizeMeta({
+        id: "a",
+        mime: "image/png",
+        dot: {
+          on: true,
+          cols: 32,
+          colors: 8,
+          gray: true,
+          dither: "floyd",
+          markers: [{ id: "m1", name: "髪", u: 0.2, v: 0.3, r: 0.2, priority: 2, crisp: 10, density: -20, contrast: 5, line: 80, bias: "tl" }],
+        },
+      })?.dot?.markers?.[0]?.name,
+      "髪",
+    );
+    assert.deepEqual(normalizeMeta({ id: "a", mime: "image/png", dot: "bad" })?.dot, undefined);
     assert.deepEqual(
       normalizeMeta({
         id: "a",

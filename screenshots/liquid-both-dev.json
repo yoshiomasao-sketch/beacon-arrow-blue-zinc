@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "ポートフォリオΔ",
+      "hasCanvas": false,
+      "bodyTextLen": 298,
+      "bodyTextHash": "367f9c111efc1f98d1ce65d5308ce4b8240865ba4c555f0e1a90dc44fd4ee643",
+      "bodyTextPrefix": "フォルダ 作成 コピーフォルダ 貼りつけ すべての画像 0 未分類 0 ファイル一覧 このフォルダにファイルはありません タブ ",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/liquid-both-dev.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "ポートフォリオΔ",
+      "hasCanvas": false,
+      "bodyTextLen": 121,
+      "bodyTextHash": "894e0b6d689eb3bea42afdc4fe5a3d7fb6634cbb43420071c52bea02a3b9bb1a",
+      "bodyTextPrefix": "お気に入りのみ 傾き 未許可 保存 復元 詳細 スライドショー シャッフル 日付順でソート アニメ▶️ 選択タグ すべて一致すべ",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/liquid-both-dev-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/liquid-both-dev.json"
+}

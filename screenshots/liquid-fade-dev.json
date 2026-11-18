@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "ポートフォリオΔ",
+      "hasCanvas": false,
+      "bodyTextLen": 304,
+      "bodyTextHash": "308cfd3f584a42c9d9fcf87e06948dc4aa384eac0baa90a9b798cd53c51a65a1",
+      "bodyTextPrefix": "フォルダ 作成 コピーフォルダ 貼りつけ すべての画像 0 ファイル一覧 このフォルダにファイルはありません タブ 1 2 3 ",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/liquid-fade-dev.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "ポートフォリオΔ",
+      "hasCanvas": false,
+      "bodyTextLen": 237,
+      "bodyTextHash": "20327254818797685d4dc57a3cf57290217d5c6b82b4930b285ed2c49063a1ff",
+      "bodyTextPrefix": "フォルダ 作成 コピーフォルダ 貼りつけ すべての画像 0 ファイル一覧 このフォルダにファイルはありません タブ 昇順 降順 ",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/liquid-fade-dev-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/liquid-fade-dev.json"
+}

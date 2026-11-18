@@ -1,10 +1,11 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { ChevronLeft, ChevronRight, Droplet, Eye, EyeOff, Heart, Pencil, Play, Star, Volume2, VolumeX, Waves } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
-import { ImageInk } from "@/components/portfolio/ink-layer";
+import { ImageInk, settledInk } from "@/components/portfolio/ink-layer";
 import { LiquidLayer, type LiquidHandle } from "@/components/portfolio/liquid-layer";
 import { PuruMesh } from "@/components/portfolio/puru-mesh";
 import { VectorField } from "@/components/portfolio/vector-field";
+import { EffectField } from "@/components/portfolio/effect-field";
 import { Button } from "@/components/ui/button";
 import { readPixels } from "@/lib/portfolio/db";
 import { cachedOriginal, beginOwnFileDrag, endOwnFileDrag, hideNativeDragImage, offerOriginal, writeOriginalDrag } from "@/lib/portfolio/export-file";
@@ -47,12 +48,53 @@ import { phoneSheen } from "@/lib/portfolio/phone-sheen";
 import { THUMB_ZOOM_EASE, THUMB_ZOOM_PHONE_MS } from "@/lib/portfolio/thumb-zoom";
 import { THUMB_REST, thumbFollow, thumbTiltFromPointer, thumbUnit, type ThumbTilt } from "@/lib/portfolio/thumb-tilt";
 import { rubberDragTilt, rubberOffset, rubberRelease, rubberResting, rubberStep, type RubberState } from "@/lib/portfolio/pc-rubber";
-import type { ImageMeta, Tag } from "@/lib/portfolio/types";
-import { setInkVisible, saveImagePlay, saveImagePuru, saveImageVectors, usePortfolio } from "@/lib/portfolio/store";
+import type { DisplayCopyLive } from "@/lib/portfolio/display-copy";
+import type { ImageMeta, ImagePlay, Tag } from "@/lib/portfolio/types";
+import { clearImagePlay, copyDisplayState, addDotStill, notify, setImageDot, setInkVisible, saveImagePlay, saveImagePuru, saveImageVectors, saveImageEffects, usePortfolio, type GalleryPlate } from "@/lib/portfolio/store";
 import { animationCycle, animationFrame, animPhase, carryForPhase, twistCycle, zoomOptionCycle, type AnimKind, type AnimSpeed, type AnimTilt, type OptionPace } from "@/lib/portfolio/image-animation";
-import { stickAim, stickKnob } from "@/lib/portfolio/liquid";
+import {
+  liquidHideCircle,
+  acceptsLiquidImage,
+  liquidHideResize,
+  liquidRangeCorner,
+  liquidRangeEdge,
+  liquidRangeFace as projectRangePoint,
+  liquidRangeHit,
+  liquidRangeHeading,
+  liquidRangeLeanDrag,
+  liquidRangeLeanPoint,
+  liquidRangeMove,
+  liquidRangePivot,
+  liquidRangeResize,
+  liquidRangeSpin,
+  liquidRangeTurn,
+  liquidRangeViewCorners,
+  liquidShapeHit,
+  normalizeLiquidHide,
+  normalizeLiquidRange,
+  nextLiquidRangeId,
+  stickAim,
+  stickKnob,
+  type LiquidHide,
+  type LiquidRange,
+} from "@/lib/portfolio/liquid";
+import { goldSoundMode, syncGoldSound } from "@/lib/portfolio/gold-sfx";
+import { stopLiquidSounds, unlockLiquidAudio } from "@/lib/portfolio/liquid-sfx-play";
+import { kitReady, kitSnapshot, loadKit } from "@/lib/portfolio/media-ready";
+import { loadPercent } from "@/lib/portfolio/load-deadline";
+import { failureLabel } from "@/lib/portfolio/load-report";
 import { VOICE_TRACKS } from "@/lib/portfolio/voice-catalog";
-import { normalizeImagePlay } from "@/lib/portfolio/image-play";
+import { autoFavoriteMode, favoriteAskCopy, normalizeImagePlay, type FavoriteAsk } from "@/lib/portfolio/image-play";
+import { DotFilter } from "@/components/portfolio/dot-filter";
+import { DotMarkerLayer, DotMarkerList, DotPreview, DotStudioBar, rasterDotStill, type DotPlate } from "@/components/portfolio/dot-studio";
+import { GifFrameList } from "@/components/portfolio/gif-frame-list";
+import { enlargedPixelView } from "@/lib/portfolio/sprite-sheet";
+import { DOT_MAX, DOT_MIN, DOT_STEP, activeDot, dotColorIndex, dotColorStops, dotView } from "@/lib/portfolio/dot-filter";
+import { dotRecipe, recipeIsPlain, recipeKey } from "@/lib/portfolio/dot-recipe";
+import { renderFavoriteGif, type GifProgress } from "@/lib/portfolio/gif-export";
+import { GIF_EXPORT_COUNTS, type GifExportCount } from "@/lib/portfolio/gif-record";
+import { canSaveGif, gifSavePicker, isSaveCancel, runGifExportSave } from "@/lib/portfolio/gif-save";
+import { hiddenArrowCommand, favoritePlaybackLive } from "@/lib/portfolio/hidden-keys";
 import { applyVoiceRate, volumeToGain, VOICE_RATES, voiceRateLabel, type VoiceRate } from "@/lib/portfolio/voice-library";
 import {
   PURU_KINDS,
@@ -99,6 +141,20 @@ import {
   type VectorMarker,
   type VectorPace,
 } from "@/lib/portfolio/vector-marker";
+import {
+  EFFECT_KIND_ASSETS,
+  EFFECT_KINDS,
+  EFFECT_PACES,
+  EFFECT_SIZE_DEFAULT,
+  effectDrawSize,
+  effectListEntries,
+  nextEffectId,
+  normalizeEffectMarkers,
+  type EffectKind,
+  type EffectMarker,
+  type EffectPace,
+} from "@/lib/portfolio/effect-marker";
+import { EFFECT_ASSET_URL, primeEffectAssets } from "@/lib/portfolio/effect-assets";
 
 type Frame = { left: number; top: number; width: number; height: number };
 
@@ -172,6 +228,215 @@ function MemoLine({ text }: { text: string }) {
   );
 }
 
+function RangeToolButtons({ tool, onTool }: { tool: "range" | "circle" | "rect"; onTool: (tool: "range" | "circle" | "rect") => void }) {
+  const item = (id: "range" | "circle" | "rect", label: string, name: string) => (
+    <Button
+      variant="quiet"
+      className={tool === id ? "liquid-reset is-slim is-on" : "liquid-reset is-slim"}
+      aria-pressed={tool === id}
+      aria-label={name}
+      onPointerDown={(event) => event.stopPropagation()}
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onTool(id);
+      }}
+    >
+      {label}
+    </Button>
+  );
+  return (
+    <>
+      {item("range", "範囲", "発射範囲を追加")}
+      {item("circle", "円", "円の非表示を追加")}
+      {item("rect", "四角", "四角の非表示を追加")}
+    </>
+  );
+}
+
+function uprightAngle(radians: number): number {
+  let turn = Math.atan2(Math.sin(radians), Math.cos(radians));
+  if (turn > Math.PI / 2) turn -= Math.PI;
+  if (turn < -Math.PI / 2) turn += Math.PI;
+  return turn;
+}
+
+function LiquidRangeFace({
+  range,
+  editing,
+  aspect,
+  shape = "rect",
+  tone = "range",
+  insetU = 0.03,
+  insetV = 0.03,
+}: {
+  range: LiquidRange;
+  editing: boolean;
+  aspect: number;
+  shape?: "rect" | "circle";
+  tone?: "range" | "hide";
+  insetU?: number;
+  insetV?: number;
+}) {
+  const safe = aspect > 0.05 ? aspect : 1;
+  const corners = liquidRangeViewCorners(range, safe);
+  const center = projectRangePoint(range, 0, 0, safe);
+  const edge = (index: number) => {
+    const a = corners[index]!;
+    const b = corners[(index + 1) % 4]!;
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, angle: Math.atan2((b.y - a.y) / safe, b.x - a.x) };
+  };
+  const edges = [0, 1, 2, 3].map(edge);
+  const leans = [0, 1, 2, 3].map((index) => {
+    const point = liquidRangeLeanPoint(range, index as 0 | 1 | 2 | 3, safe, insetU, insetV);
+    const inward = Math.atan2((center.y - point.y) / safe, center.x - point.x);
+    return { ...point, edge: index, spin: inward + Math.PI / 2 };
+  });
+  const labelAt = (index: number, text: string) => {
+    const side = edges[index]!;
+    const outward = Math.atan2(side.y - center.y, side.x - center.x);
+    return {
+      text,
+      x: side.x + Math.cos(outward) * 0.045,
+      y: side.y + Math.sin(outward) * 0.045,
+      spin: uprightAngle(side.angle),
+    };
+  };
+  const pin = (x: number, y: number, spin: string) => ({ left: `${x * 100}%`, top: `${y * 100}%`, margin: 0, transform: spin });
+  const outline =
+    shape === "circle"
+      ? Array.from({ length: 40 }, (_, index) => {
+          const turn = (index / 40) * Math.PI * 2;
+          const point = projectRangePoint(range, Math.cos(turn) * (range.w / 2), Math.sin(turn) * (range.h / 2), safe);
+          return `${point.x * 100},${point.y * 100}`;
+        }).join(" ")
+      : corners.map((point) => `${point.x * 100},${point.y * 100}`).join(" ");
+  return (
+    <>
+      <svg className={tone === "hide" ? "liquid-range-face is-hide" : "liquid-range-face"} viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+        <polygon points={outline} />
+      </svg>
+      {editing ? (
+        <>
+          <span className="liquid-range-mark" style={pin(labelAt(0, "上").x, labelAt(0, "上").y, `translate(-50%, -50%) rotate(${labelAt(0, "上").spin}rad)`)}>
+            上
+          </span>
+          <span className="liquid-range-mark" style={pin(labelAt(2, "下").x, labelAt(2, "下").y, `translate(-50%, -50%) rotate(${labelAt(2, "下").spin}rad)`)}>
+            下
+          </span>
+          {corners.map((point, index) => (
+            <span key={`corner-${index}`} className="liquid-range-handle is-corner" style={pin(point.x, point.y, "translate(-50%, -50%)")} />
+          ))}
+          {edges.map((side, index) => (
+            <span key={`edge-${index}`} className="liquid-range-handle is-edge" style={pin(side.x, side.y, `translate(-50%, -50%) rotate(${side.angle + Math.PI / 4}rad)`)} />
+          ))}
+          {leans.map((handle) => (
+            <span
+              key={`lean-${handle.edge}`}
+              className="liquid-range-handle is-lean"
+              style={pin(handle.x, handle.y, `translate(-50%, -50%) rotate(${handle.spin}rad) scale(${Math.max(0.72, Math.min(1.35, handle.scale))})`)}
+            />
+          ))}
+          <span className="liquid-range-handle is-move" style={pin(center.x, center.y, "translate(-50%, -50%)")} />
+        </>
+      ) : null}
+    </>
+  );
+}
+
+function DotControl({
+  mode,
+  show,
+  mosaic,
+  colorOn,
+  cols,
+  colors,
+  menuOpen = false,
+  onMenu,
+  onShow,
+  onMosaic,
+  onColor,
+  onCols,
+  onColors,
+}: {
+  mode: "phone" | "pc";
+  show: boolean;
+  mosaic: boolean;
+  colorOn: boolean;
+  cols: number;
+  colors: number;
+  menuOpen?: boolean;
+  onMenu?: () => void;
+  onShow?: (on: boolean) => void;
+  onMosaic?: (on: boolean) => void;
+  onColor?: (on: boolean) => void;
+  onCols?: (cols: number) => void;
+  onColors?: (colors: number) => void;
+}) {
+  const phone = mode === "phone";
+  const open = phone ? mosaic : menuOpen;
+  if (!phone) {
+    return (
+      <span className={open ? "lightbox-dot is-open" : "lightbox-dot"} onPointerDown={(event) => event.stopPropagation()}>
+        <span className="lightbox-dot-split" role="group" aria-label="ドット">
+          <button
+            type="button"
+            className={show ? "is-view is-on" : "is-view"}
+            aria-label={show ? "ドット表示を解除" : "ドット表示"}
+            aria-pressed={show}
+            onClick={() => onShow?.(!show)}
+          />
+          <button
+            type="button"
+            className={open ? "is-panel is-open" : "is-panel"}
+            aria-label={open ? "ドット設定を閉じる" : "ドット設定"}
+            aria-pressed={open}
+            aria-expanded={open}
+            onClick={() => onMenu?.()}
+          >
+            ドット
+          </button>
+        </span>
+        {open ? (
+          <span className="lightbox-dot-sliders">
+            <span className="lightbox-dot-range">
+              <input className="lightbox-dot-check" type="checkbox" checked={mosaic} aria-label="ドット化" onChange={(event) => onMosaic?.(event.target.checked)} />
+              <input type="range" min={DOT_MIN} max={DOT_MAX} step={DOT_STEP} value={cols} aria-label="ドット数" onChange={(event) => onCols?.(Number(event.target.value))} />
+              <span className="tabular-nums">{cols}</span>
+            </span>
+            <span className="lightbox-dot-range">
+              <input className="lightbox-dot-check" type="checkbox" checked={colorOn} aria-label="減色" onChange={(event) => onColor?.(event.target.checked)} />
+              <input
+                type="range"
+                min={0}
+                max={dotColorStops().length - 1}
+                step={1}
+                value={dotColorIndex(colors)}
+                aria-label="色数"
+                onChange={(event) => onColors?.(dotColorStops()[Number(event.target.value)] ?? colors)}
+              />
+              <span className="tabular-nums">{colors}</span>
+            </span>
+          </span>
+        ) : null}
+      </span>
+    );
+  }
+  return (
+    <span className="lightbox-dot" onPointerDown={(event) => event.stopPropagation()}>
+      <Button
+        variant="quiet"
+        className={show ? "lightbox-fav is-dot is-on" : "lightbox-fav is-dot"}
+        aria-label={show ? "ドット表示を解除" : "ドット表示"}
+        aria-pressed={show}
+        onClick={() => onShow?.(!show)}
+      >
+        ドット
+      </Button>
+    </span>
+  );
+}
+
 export function Lightbox({
   item,
   index,
@@ -185,6 +450,9 @@ export function Lightbox({
   launchInk = null,
   contained = false,
   container = null,
+  onCopied,
+  plate = "clear",
+  onPlate,
 }: {
   item: ImageMeta | null;
   index: number;
@@ -198,6 +466,9 @@ export function Lightbox({
   launchInk?: { current: boolean } | null;
   contained?: boolean;
   container?: HTMLElement | null;
+  onCopied?: (id: string) => void;
+  plate?: GalleryPlate;
+  onPlate?: (plate: GalleryPlate) => void;
 }) {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
@@ -207,6 +478,22 @@ export function Lightbox({
   const [stageBox, setStageBox] = useState({ width: 0, height: 0 });
   const [hot, setHot] = useState<"prev" | "next" | null>(null);
   const [phone, setPhone] = useState(() => typeof window !== "undefined" && window.matchMedia("(max-width: 899px)").matches);
+  const [frameFor, setFrameFor] = useState<string | null>(null);
+  const frameBackRef = useRef<(() => void) | null>(null);
+  const frameListRef = useRef(false);
+  frameListRef.current = frameFor !== null && frameFor === (item?.id ?? null) && !phone;
+  const bindFrameBack = useCallback((fn: (() => void) | null) => {
+    frameBackRef.current = fn;
+  }, []);
+  const [dotMenu, setDotMenu] = useState(false);
+  const [dotStudio, setDotStudio] = useState(false);
+  const [dotPick, setDotPick] = useState<string | null>(null);
+  const [dotEdit, setDotEdit] = useState(false);
+  const [dotPlate, setDotPlate] = useState<DotPlate>("clear");
+  const [dotPlace, setDotPlace] = useState(false);
+  const [dotAnchor, setDotAnchor] = useState(0);
+  const [dotRange, setDotRange] = useState<number | null>(null);
+  const navMidRef = useRef<HTMLDivElement | null>(null);
   const [scrimIn, setScrimIn] = useState(1);
   const [scrimArm, setScrimArm] = useState(false);
   const scrimOpened = useRef(false);
@@ -248,6 +535,10 @@ export function Lightbox({
   const [animMenu, setAnimMenu] = useState(false);
   const [animHold, setAnimHold] = useState(false);
   const [phonePlay, setPhonePlay] = useState(false);
+  const [copying, setCopying] = useState(false);
+  const copyLock = useRef(false);
+  const dotCopyLock = useRef(false);
+  const [dotCopying, setDotCopying] = useState(false);
   const [sensorMenu, setSensorMenu] = useState(false);
   const [sensorStatus, setSensorStatus] = useState<"idle" | "on" | "denied" | "unavailable" | "insecure">("idle");
   const [sensorNote, setSensorNote] = useState("停止中");
@@ -276,6 +567,12 @@ export function Lightbox({
   animZoomPaceRef.current = animZoomPace;
   animTwistPaceRef.current = animTwistPace;
   animTiltRef.current = animTilt;
+  const animHoldRef = useRef(false);
+  animHoldRef.current = animHold;
+  const studioHoldRef = useRef(false);
+  const dotStudioRef = useRef(false);
+  const studioStillRef = useRef<HTMLCanvasElement>(null);
+  dotStudioRef.current = dotStudio;
   const sensorOpenRef = useRef(false);
   sensorOpenRef.current = Boolean(item) && phone;
   const animLive = !animHold && (animKind !== null || animZoom || animTwist);
@@ -283,19 +580,21 @@ export function Lightbox({
   const [voiceRateOpen, setVoiceRateOpen] = useState(false);
   const [voiceRate, setVoiceRate] = useState<VoiceRate>(1);
   const [voiceId, setVoiceId] = useState<string | null>(null);
-  const [volume, setVolume] = useState(25);
+  const [volume, setVolume] = useState(50);
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const voiceIdRef = useRef<string | null>(null);
   const voiceRateRef = useRef<VoiceRate>(1);
-  const volumeRef = useRef(25);
+  const volumeRef = useRef(50);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const voiceGen = useRef(0);
+  const voiceWaitRef = useRef<(() => void) | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const gainRef = useRef<GainNode | null>(null);
   const voiceBoundRef = useRef<HTMLAudioElement | null>(null);
   voiceIdRef.current = voiceId;
   voiceRateRef.current = voiceRate;
   const [puruEdit, setPuruEdit] = useState(false);
-  const [puruMarkers, setPuruMarkers] = useState<PuruMarker[]>([]);
+  const [puruMarkers, setPuruMarkers] = useState<PuruMarker[]>(() => (normalizePuruMarkers(item?.puru) ?? []).map((marker) => ({ ...marker })));
   const [puruSelected, setPuruSelected] = useState<number | null>(null);
   const [puruDrawn, setPuruDrawn] = useState(false);
   const puruMarkersRef = useRef<PuruMarker[]>([]);
@@ -322,8 +621,51 @@ export function Lightbox({
   const vectorDriveRef = useRef<{ playing: boolean; origin: number; markers: VectorMarker[] }>({ playing: false, origin: 0, markers: [] });
   const vectorGhostRef = useRef<{ kind: VectorKind; pace: VectorPace; id: number; x: number; y: number } | null>(null);
   const [vectorGhost, setVectorGhost] = useState<{ kind: VectorKind; pace: VectorPace; x: number; y: number; inside: boolean; size: number } | null>(null);
+  const effectGhostRef = useRef<{ kind: EffectKind; pace: EffectPace; id: number; x: number; y: number } | null>(null);
+  const [effectGhost, setEffectGhost] = useState<{ kind: EffectKind; pace: EffectPace; x: number; y: number; inside: boolean; w: number; h: number } | null>(null);
   const vectorMarkersRef = useRef<VectorMarker[]>(vectorMarkers);
   const vectorSavedRef = useRef(JSON.stringify(normalizeVectorMarkers(item?.vectors) ?? []));
+  const [effectEdit, setEffectEdit] = useState(false);
+  const [effectMarkers, setEffectMarkers] = useState<EffectMarker[]>(() => {
+    if (item?.effects) return normalizeEffectMarkers(item.effects) ?? [];
+    return normalizeImagePlay(item?.play)?.effects ?? [];
+  });
+  const [effectSelected, setEffectSelected] = useState<number | null>(null);
+  const [effectPace, setEffectPace] = useState<EffectPace>("normal");
+  const [effectKind, setEffectKind] = useState<EffectKind>("splash");
+  const [effectPlay, setEffectPlay] = useState(false);
+  const [effectPreview, setEffectPreview] = useState(false);
+  const [effectOrigin, setEffectOrigin] = useState(0);
+  const effectEditRef = useRef(false);
+  const effectMarkersRef = useRef<EffectMarker[]>(effectMarkers);
+  const effectPaceRef = useRef<EffectPace>("normal");
+  const effectPlayRef = useRef(false);
+  const effectPreviewRef = useRef(false);
+  const markerHoldRef = useRef<{ vector: boolean; effect: boolean } | null>(null);
+  useEffect(() => {
+    syncGoldSound(
+      goldSoundMode({
+        playing: effectPlay,
+        preview: effectPreview,
+        held: markerHoldRef.current?.effect === true,
+        goldVisible: effectMarkers.some((marker) => marker.kind === "gold" && marker.off !== true),
+      }),
+    );
+  }, [effectPlay, effectPreview, effectMarkers]);
+  const effectSavedRef = useRef(JSON.stringify(item?.effects ? (normalizeEffectMarkers(item.effects) ?? []) : (normalizeImagePlay(item?.play)?.effects ?? [])));
+  const puruSavedRef = useRef(JSON.stringify(normalizePuruMarkers(item?.puru) ?? []));
+  const puruSaveTimer = useRef(0);
+  const vectorSaveTimer = useRef(0);
+  const effectSaveTimer = useRef(0);
+  const puruSaveGen = useRef(0);
+  const vectorSaveGen = useRef(0);
+  const effectSaveGen = useRef(0);
+  const puruFailedRef = useRef(false);
+  const vectorFailedRef = useRef(false);
+  const effectFailedRef = useRef(false);
+  const flushPuruRef = useRef<() => void>(() => undefined);
+  const flushVectorsRef = useRef<() => void>(() => undefined);
+  const flushEffectsRef = useRef<() => void>(() => undefined);
   const puruSelectedRef = useRef<number | null>(null);
   const puruPointers = useRef(new Map<number, { x: number; y: number }>());
   const puruPinch = useRef<{ dist: number; radius: number } | null>(null);
@@ -335,14 +677,77 @@ export function Lightbox({
   >(null);
   const puruGhostRef = useRef<{ kind: PuruKind; id: number; x: number; y: number } | null>(null);
   const [puruGhost, setPuruGhost] = useState<{ kind: PuruKind; x: number; y: number; inside: boolean; size: number } | null>(null);
-  const [puruNote, setPuruNote] = useState("");
+  const [markerSaveError, setMarkerSaveError] = useState("");
   const [playNote, setPlayNote] = useState("");
+  const [gifJob, setGifJob] = useState<GifProgress | null>(null);
+  const [gifFrames, setGifFrames] = useState<GifExportCount>(128);
+  const [gifDotByDot, setGifDotByDot] = useState(false);
+  const [playAsk, setPlayAsk] = useState<FavoriteAsk | null>(null);
+  const [playAskSaved, setPlayAskSaved] = useState(false);
+  const playAskRef = useRef<ImagePlay | null>(null);
+  const playAskIdRef = useRef<string | null>(null);
+  const playConfirming = useRef(false);
+  const cancelFavoriteRef = useRef<() => void>(() => undefined);
   const [pcTools, setPcTools] = useState(false);
   const pcToolsRef = useRef(false);
+  const autoArmed = useRef(false);
   pcToolsRef.current = pcTools;
   const [liquidMode, setLiquidMode] = useState(false);
   const [liquidFree, setLiquidFree] = useState(1);
   const liquidModeRef = useRef(false);
+  const [liquidRanges, setLiquidRanges] = useState<LiquidRange[]>(() => normalizeImagePlay(item?.play)?.liquid ?? []);
+  const liquidRangesRef = useRef<LiquidRange[]>(liquidRanges);
+  const [liquidHides, setLiquidHides] = useState<LiquidHide[]>(() => normalizeImagePlay(item?.play)?.liquidHide ?? []);
+  const liquidHidesRef = useRef<LiquidHide[]>(liquidHides);
+  const [liquidPick, setLiquidPick] = useState<{ kind: "range" | "hide"; id: number } | null>(() => {
+    const play = normalizeImagePlay(item?.play);
+    const ranges = play?.liquid ?? [];
+    const hides = play?.liquidHide ?? [];
+    const range = ranges.length > 0 ? ranges[ranges.length - 1] : null;
+    if (range?.id != null) return { kind: "range", id: range.id };
+    const hide = hides.length > 0 ? hides[hides.length - 1] : null;
+    return hide?.id != null ? { kind: "hide", id: hide.id } : null;
+  });
+  const liquidPickRef = useRef<{ kind: "range" | "hide"; id: number } | null>(liquidPick);
+  const [rangeTool, setRangeTool] = useState<"range" | "circle" | "rect">("range");
+  const rangeHoldRef = useRef<{ anim: boolean; vector: boolean } | null>(null);
+  const [liquidRangeMode, setLiquidRangeMode] = useState(false);
+  const liquidRangeModeRef = useRef(false);
+  const [rangeDraft, setRangeDraft] = useState<LiquidRange | null>(null);
+  const [hideDraft, setHideDraft] = useState<LiquidHide | null>(null);
+  const [rangeGesture, setRangeGesture] = useState<"new" | "edit" | null>(null);
+  const rangeDragRef = useRef<
+    | { id: number; kind: "new"; tool: "range" | "circle" | "rect"; u: number; v: number }
+    | { id: number; kind: "move"; u: number; v: number; box: LiquidRange; target: "range" | "hide"; shape: "rect" | "circle" }
+    | { id: number; kind: "resize"; corner: 0 | 1 | 2 | 3; box: LiquidRange; aspect: number; target: "range" | "hide"; shape: "rect" | "circle" }
+    | { id: number; kind: "turn"; offset: number; box: LiquidRange; aspect: number; target: "range" | "hide"; shape: "rect" | "circle" }
+    | { id: number; kind: "lean"; edge: 0 | 1 | 2 | 3; u: number; v: number; box: LiquidRange; aspect: number; target: "range" | "hide"; shape: "rect" | "circle" }
+    | { id: number; kind: "corner"; corner: 0 | 1 | 2 | 3; box: LiquidRange; aspect: number; target: "range"; shape: "rect" | "circle" }
+    | { id: number; kind: "face"; edge: 0 | 1 | 2 | 3; u: number; v: number; box: LiquidRange; aspect: number; target: "range"; shape: "rect" | "circle" }
+    | { id: number; kind: "spin"; offset: number; box: LiquidRange; aspect: number; target: "range"; shape: "rect" | "circle" }
+    | null
+  >(null);
+  const rangePlaneRef = useRef<HTMLDivElement | null>(null);
+  const liquidArm = useRef(0);
+  const liquidBooting = useRef(false);
+  const hiddenKeys = useRef(new Set<string>());
+  const recallPlayRef = useRef<() => void>(() => undefined);
+  const stopTogetherRef = useRef<() => void>(() => undefined);
+  const toggleLiquidRef = useRef<() => void>(() => undefined);
+  const hiddenArm = useRef(0);
+  const phoneAnimArm = useRef(0);
+  const gateRetryRef = useRef<(() => void) | null>(null);
+  const gateProceedRef = useRef<(() => void) | null>(null);
+  const gateCancelRef = useRef<(() => void) | null>(null);
+  const [mediaGate, setMediaGate] = useState<null | {
+    title: string;
+    note: string;
+    done: number;
+    total: number;
+    failed: string[];
+    active: { id: string; stage: string }[];
+    busy: boolean;
+  }>(null);
   const liquidRef = useRef<LiquidHandle>(null);
   const stickRef = useRef<{ id: number; cx: number; cy: number; r: number } | null>(null);
   const stickKnobRef = useRef<HTMLSpanElement>(null);
@@ -351,25 +756,38 @@ export function Lightbox({
   const itemRef = useRef(item);
   itemRef.current = item;
   if ((item?.id ?? null) !== puruItemId) {
-    const leaving = puruItemId;
-    const leavingMarkers = vectorMarkersRef.current.map((marker) => ({ ...marker }));
-    const leavingKey = JSON.stringify(leavingMarkers);
-    if (leaving && leavingKey !== vectorSavedRef.current) {
-      vectorSavedRef.current = leavingKey;
-      void saveImageVectors(leaving, leavingMarkers).then((ok) => {
-        if (!ok && vectorSavedRef.current === leavingKey) vectorSavedRef.current = "";
-      });
-    }
+    window.clearTimeout(puruSaveTimer.current);
+    puruSaveTimer.current = 0;
+    window.clearTimeout(vectorSaveTimer.current);
+    vectorSaveTimer.current = 0;
+    puruMarkersRef.current = puruMarkers;
+    vectorMarkersRef.current = vectorMarkers;
+    flushPuruRef.current();
+    flushVectorsRef.current();
+    flushEffectsRef.current();
     const loaded = (normalizeVectorMarkers(item?.vectors) ?? []).map((marker) => ({ ...marker }));
+    const loadedPuru = (normalizePuruMarkers(item?.puru) ?? []).map((marker) => ({ ...marker }));
+    const loadedEffects = item?.effects
+      ? (normalizeEffectMarkers(item.effects) ?? []).map((marker) => ({ ...marker }))
+      : (normalizeImagePlay(item?.play)?.effects ?? []).map((marker) => ({ ...marker }));
     vectorSavedRef.current = JSON.stringify(loaded);
+    puruSavedRef.current = JSON.stringify(loadedPuru);
+    effectSavedRef.current = JSON.stringify(loadedEffects);
     vectorMarkersRef.current = loaded;
+    puruMarkersRef.current = loadedPuru;
+    effectMarkersRef.current = loadedEffects;
+    puruFailedRef.current = false;
+    vectorFailedRef.current = false;
+    effectFailedRef.current = false;
     const nextId = item?.id ?? null;
     setPuruItemId(nextId);
-    setPuruMarkers((normalizePuruMarkers(item?.puru) ?? []).map((marker) => ({ ...marker })));
+    setPuruMarkers(loadedPuru);
     setPuruSelected(null);
     setPuruEdit(false);
     setPuruDrawn(false);
-    setPuruNote("");
+    setFrameFor(null);
+    frameBackRef.current = null;
+    if (markerSaveError) setMarkerSaveError("");
     setVectorMarkers(loaded);
     setVectorSelected(null);
     setVectorArmed(null);
@@ -377,13 +795,78 @@ export function Lightbox({
     setVectorPlay(false);
     setVectorShown(false);
     setVectorNote("");
+    setEffectMarkers(loadedEffects);
+    setEffectSelected(null);
+    setEffectEdit(false);
+    setEffectPace("normal");
+    setEffectKind("splash");
+    setEffectPlay(false);
+    setEffectPreview(false);
+    setEffectOrigin(0);
+    effectEditRef.current = false;
+    effectPaceRef.current = "normal";
+    effectPlayRef.current = false;
+    effectPreviewRef.current = false;
+    effectGhostRef.current = null;
+    setEffectGhost(null);
+    markerHoldRef.current = null;
+    syncGoldSound("stop");
     vectorEditRef.current = false;
     vectorPlayRef.current = false;
     vectorHoldRef.current = false;
     vectorRecallRef.current = false;
     vectorOriginRef.current = 0;
     liquidRef.current?.clear();
-    if (item && (item.animated || !item.mime.startsWith("image/"))) {
+    const loadedPlay = normalizeImagePlay(item?.play);
+    const loadedLiquid = loadedPlay?.liquid ?? [];
+    const loadedHides = loadedPlay?.liquidHide ?? [];
+    liquidRangesRef.current = loadedLiquid;
+    liquidHidesRef.current = loadedHides;
+    setLiquidRanges(loadedLiquid);
+    setLiquidHides(loadedHides);
+    const loadedRange = loadedLiquid.length > 0 ? loadedLiquid[loadedLiquid.length - 1] : null;
+    const loadedHide = loadedHides.length > 0 ? loadedHides[loadedHides.length - 1] : null;
+    const loadedPick =
+      loadedRange?.id != null ? { kind: "range" as const, id: loadedRange.id } : loadedHide?.id != null ? { kind: "hide" as const, id: loadedHide.id } : null;
+    liquidPickRef.current = loadedPick;
+    setLiquidPick(loadedPick);
+    setRangeTool("range");
+    setLiquidRangeMode(false);
+    setRangeDraft(null);
+    setHideDraft(null);
+    setRangeGesture(null);
+    rangeDragRef.current = null;
+    if (autoFavoriteMode(phone, pcTools)) {
+      animKindRef.current = null;
+      animZoomRef.current = false;
+      animTwistRef.current = false;
+      animTiltRef.current = null;
+      const clock = animClock.current;
+      clock.carry.base = 0;
+      clock.carry.zoom = 0;
+      clock.carry.twist = 0;
+      clock.frozen = null;
+      clock.running = false;
+      if (animKind !== null) setAnimKind(null);
+      if (animZoom) setAnimZoom(false);
+      if (animTwist) setAnimTwist(false);
+      if (animTilt !== null) setAnimTilt(null);
+      if (animHold) setAnimHold(false);
+      voiceGen.current += 1;
+      voiceIdRef.current = null;
+      setVoiceId(null);
+      setVoiceError(null);
+      const audio = audioRef.current;
+      if (audio) {
+        audio.pause();
+        try {
+          audio.currentTime = 0;
+        } catch {
+          /* the next image starts its own sound */
+        }
+      }
+    }
+    if (item && !acceptsLiquidImage(item)) {
       liquidModeRef.current = false;
       setLiquidMode(false);
     }
@@ -394,13 +877,29 @@ export function Lightbox({
     setMeshReady(false);
   }
   shownIdRef.current = item?.id ?? null;
-  puruMarkersRef.current = puruMarkers;
+  if ((item?.id ?? null) === puruItemId) puruMarkersRef.current = puruMarkers;
   puruEditRef.current = puruEdit;
   puruSelectedRef.current = puruSelected;
   if ((item?.id ?? null) === puruItemId) vectorMarkersRef.current = vectorMarkers;
+  if ((item?.id ?? null) === puruItemId) effectMarkersRef.current = effectMarkers;
   vectorEditRef.current = vectorEdit;
+  effectEditRef.current = effectEdit;
+  effectPaceRef.current = effectPace;
+  if ((item?.id ?? null) !== puruItemId) effectPlayRef.current = false;
+  else effectPlayRef.current = effectPlay;
+  if ((item?.id ?? null) !== puruItemId) effectPreviewRef.current = false;
+  else effectPreviewRef.current = effectPreview;
   if ((item?.id ?? null) !== puruItemId) vectorPlayRef.current = false;
   else vectorPlayRef.current = vectorPlay;
+  if ((item?.id ?? null) !== puruItemId) {
+    liquidRangeModeRef.current = false;
+    rangeHoldRef.current = null;
+  } else {
+    liquidRangeModeRef.current = liquidRangeMode;
+    liquidRangesRef.current = liquidRanges;
+    liquidHidesRef.current = liquidHides;
+    liquidPickRef.current = liquidPick;
+  }
   vectorDriveRef.current = {
     playing: vectorPlayRef.current,
     origin: vectorOriginRef.current,
@@ -410,9 +909,24 @@ export function Lightbox({
   const [inkDock, setInkDock] = useState<HTMLDivElement | null>(null);
   const hasInk = usePortfolio((state) => (item && !item.animated ? state.inkIds.includes(item.id) : false));
   const inkShown = item?.inkVisible !== false;
+  const dotImage = Boolean(item && item.mime.startsWith("image/"));
+  const dotRecord = dotImage ? item?.dot : undefined;
+  const dotState = dotView(dotRecord);
+  const dotShow = dotState.show;
+  const dotMosaic = phone ? Boolean(dotRecord?.on === true) : dotState.mosaic;
+  const dotColorOn = phone ? Boolean(dotRecord?.colorOn === true) : dotState.colorOn;
+  const dotCols = dotState.cols;
+  const dotColors = dotState.colors;
+  const dotPaint = activeDot(dotRecord);
+  const dotRecipeLive = dotRecipe(dotRecord);
+  const dotFancyKey = recipeKey(dotRecipeLive);
+  const dotFancy = dotShow && !recipeIsPlain(dotRecipeLive);
+  const dotActive = dotPaint.cols != null || dotPaint.colors != null || dotFancy;
+  const dotPaintCols = dotPaint.cols;
+  const dotPaintColors = dotPaint.colors;
   const canInk = Boolean(item && !phone && !item.animated);
   const editing = canInk && (inkOn || Boolean(launchInk?.current));
-  const markerMode = puruEdit || vectorEdit;
+  const markerMode = puruEdit || vectorEdit || effectEdit;
   const editingRef = useRef(false);
   editingRef.current = editing;
   useEffect(() => {
@@ -491,6 +1005,10 @@ export function Lightbox({
   const shakeTimer = useRef(0);
   const stopShakeRef = useRef<() => void>(() => {});
   const mediaRef = useRef<HTMLImageElement | HTMLVideoElement | null>(null);
+  const pixelHold = useRef<{ id: string; on: boolean }>({ id: "", on: false });
+  const incomingMediaRef = useRef<HTMLImageElement | null>(null);
+  const meshSurfaceRef = useRef<HTMLCanvasElement | null>(null);
+  const gifAbort = useRef<AbortController | null>(null);
   const urls = useRef(new Map<string, string>());
   const loadingUrls = useRef(new Set<string>());
   const slideDir = useRef<-1 | 0 | 1>(0);
@@ -556,6 +1074,29 @@ export function Lightbox({
   if (phone !== seenPhone.current) {
     seenPhone.current = phone;
     phoneRef.current = phone;
+    if (phone) {
+      if (frameFor !== null) setFrameFor(null);
+      if (vectorEditRef.current) {
+        vectorEditRef.current = false;
+        setVectorEdit(false);
+      }
+      if (effectEditRef.current || effectPreviewRef.current) {
+        effectEditRef.current = false;
+        effectPreviewRef.current = false;
+        effectGhostRef.current = null;
+        setEffectEdit(false);
+        setEffectPreview(false);
+        setEffectGhost(null);
+      }
+      if (liquidRangeModeRef.current) {
+        liquidRangeModeRef.current = false;
+        rangeDragRef.current = null;
+        setLiquidRangeMode(false);
+        setRangeDraft(null);
+        setHideDraft(null);
+        setRangeGesture(null);
+      }
+    }
     if (!phone) {
       zoomRef.current = IDENTITY_ZOOM;
       gestureRef.current = freshGesture();
@@ -654,6 +1195,79 @@ export function Lightbox({
   }, []);
 
   useEffect(() => {
+    if (!phone) return;
+    setDotMenu(false);
+    setDotStudio(false);
+    setDotAnchor(0);
+    setDotRange(null);
+  }, [phone]);
+
+  useEffect(() => {
+    setDotMenu(false);
+    setDotStudio(false);
+    setDotPick(null);
+    setDotEdit(false);
+    setDotAnchor(0);
+    setDotRange(null);
+  }, [item?.id]);
+
+  useEffect(() => {
+    if (!puruEdit && !vectorEdit && !effectEdit) return;
+    setDotMenu(false);
+    setDotStudio(false);
+    setDotAnchor(0);
+    setDotRange(null);
+  }, [puruEdit, vectorEdit, effectEdit]);
+
+  useEffect(() => {
+    if (!dotMenu || phone) return;
+    const onResize = () => {
+      const mid = navMidRef.current;
+      if (!mid) return;
+      const sliders = mid.querySelector(".lightbox-dot-sliders");
+      const dot = mid.querySelector(".lightbox-dot");
+      if (!(sliders instanceof HTMLElement) || !(dot instanceof HTMLElement)) return;
+      const prevWidth = mid.style.width;
+      const prevMax = mid.style.maxWidth;
+      const prevMin = mid.style.minWidth;
+      mid.style.width = "max-content";
+      mid.style.maxWidth = "none";
+      mid.style.minWidth = "0";
+      const full = mid.getBoundingClientRect().width;
+      const gap = Number.parseFloat(getComputedStyle(dot).columnGap || getComputedStyle(dot).gap) || 0;
+      const closed = Math.max(0, Math.round(full - sliders.getBoundingClientRect().width - gap));
+      mid.style.width = prevWidth;
+      mid.style.maxWidth = prevMax;
+      mid.style.minWidth = prevMin;
+      setDotAnchor(closed);
+      setDotRange(null);
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [dotMenu, phone]);
+
+  useLayoutEffect(() => {
+    if (phone || !dotMenu || dotAnchor <= 0) return;
+    const mid = navMidRef.current;
+    const nav = mid?.closest(".lightbox-nav");
+    if (!mid || !(nav instanceof HTMLElement)) return;
+    const nextBtn = nav.lastElementChild;
+    const limit = nextBtn instanceof HTMLElement ? nextBtn.getBoundingClientRect().left - 8 : nav.getBoundingClientRect().right - 8;
+    let right = mid.getBoundingClientRect().left;
+    for (const node of mid.children) {
+      if (!(node instanceof HTMLElement)) continue;
+      right = Math.max(right, node.getBoundingClientRect().right);
+    }
+    const overflow = right - limit;
+    if (overflow <= 1) return;
+    const sample = mid.querySelector(".lightbox-dot-sliders input[type=range]");
+    const current = sample instanceof HTMLElement ? sample.getBoundingClientRect().width : 0;
+    if (current <= 36) return;
+    const next = Math.max(36, Math.floor(current - overflow));
+    setDotRange((prev) => (prev != null && Math.abs(prev - next) <= 1 ? prev : next));
+  }, [dotMenu, dotAnchor, dotRange, phone, item?.id]);
+
+  useEffect(() => {
     if (!item?.id) return;
     const frame = window.requestAnimationFrame(() => {
       armed.current = true;
@@ -686,8 +1300,15 @@ export function Lightbox({
 
   useEffect(() => {
     if (item !== null) return;
+    liquidArm.current += 1;
+    hiddenArm.current += 1;
+    phoneAnimArm.current += 1;
+    setMediaGate(null);
+    stopLiquidSounds();
     setPcTools(false);
     liquidModeRef.current = false;
+    liquidBooting.current = false;
+    hiddenKeys.current.clear();
     setLiquidMode(false);
     liquidRef.current?.clear();
     setVoiceMenu(false);
@@ -810,8 +1431,9 @@ export function Lightbox({
       const zoom = animZoomRef.current;
       const twist = animTwistRef.current;
       if (stage && box && (kind || zoom || twist)) {
-        const editingMesh = puruEditRef.current || (vectorEditRef.current && !vectorPlayRef.current);
+        const editingMesh = puruEditRef.current || effectEditRef.current || (vectorEditRef.current && !vectorPlayRef.current);
         const holding =
+          studioHoldRef.current ||
           editingMesh ||
           gestureRef.current.pointers.length > 0 ||
           Math.abs(dragRef.current.x) > 0.5 ||
@@ -873,16 +1495,66 @@ export function Lightbox({
   const itemId = item?.id ?? null;
 
   useEffect(() => {
+    void primeEffectAssets();
+  }, []);
+
+  useEffect(() => {
     if (!vectorNote) return;
     const timer = window.setTimeout(() => setVectorNote(""), 1600);
     return () => window.clearTimeout(timer);
   }, [vectorNote]);
 
   useEffect(() => {
-    if (!puruNote) return;
-    const timer = window.setTimeout(() => setPuruNote(""), 1600);
-    return () => window.clearTimeout(timer);
-  }, [puruNote]);
+    const key = JSON.stringify(puruMarkers);
+    if (key === puruSavedRef.current) return;
+    window.clearTimeout(puruSaveTimer.current);
+    puruSaveTimer.current = window.setTimeout(() => {
+      puruSaveTimer.current = 0;
+      flushPuruRef.current();
+    }, 300);
+    return () => window.clearTimeout(puruSaveTimer.current);
+  }, [puruMarkers]);
+
+  useEffect(() => {
+    const key = JSON.stringify(vectorMarkers);
+    if (key === vectorSavedRef.current) return;
+    window.clearTimeout(vectorSaveTimer.current);
+    vectorSaveTimer.current = window.setTimeout(() => {
+      vectorSaveTimer.current = 0;
+      flushVectorsRef.current();
+    }, 300);
+    return () => window.clearTimeout(vectorSaveTimer.current);
+  }, [vectorMarkers]);
+
+  useEffect(() => {
+    const key = JSON.stringify(effectMarkers);
+    if (key === effectSavedRef.current) return;
+    window.clearTimeout(effectSaveTimer.current);
+    effectSaveTimer.current = window.setTimeout(() => {
+      effectSaveTimer.current = 0;
+      flushEffectsRef.current();
+    }, 300);
+    return () => window.clearTimeout(effectSaveTimer.current);
+  }, [effectMarkers]);
+
+  useEffect(() => {
+    const flush = () => {
+      window.clearTimeout(puruSaveTimer.current);
+      puruSaveTimer.current = 0;
+      window.clearTimeout(vectorSaveTimer.current);
+      vectorSaveTimer.current = 0;
+      window.clearTimeout(effectSaveTimer.current);
+      effectSaveTimer.current = 0;
+      flushPuruRef.current();
+      flushVectorsRef.current();
+      flushEffectsRef.current();
+    };
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      flush();
+    };
+  }, []);
 
   useEffect(() => {
     if (!phone) return;
@@ -903,14 +1575,28 @@ export function Lightbox({
     const timer = window.setTimeout(() => setPlayNote(""), 1600);
     return () => window.clearTimeout(timer);
   }, [playNote]);
+  useEffect(() => () => gifAbort.current?.abort(), []);
+
+  useEffect(() => {
+    if (!playAsk) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      cancelFavoriteRef.current();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [playAsk]);
 
   useEffect(() => {
     setPlayNote("");
+    playAskRef.current = null;
+    playAskIdRef.current = null;
+    playConfirming.current = false;
+    setPlayAsk(null);
+    setPlayAskSaved(false);
   }, [itemId]);
-
-  useEffect(() => {
-    setPuruNote("");
-  }, [puruMarkers]);
 
   useEffect(() => {
     if (puruMarkers.length === 0) setPuruDrawn(false);
@@ -963,7 +1649,8 @@ export function Lightbox({
   }, [itemId, prevId, nextId, phone]);
 
   const step = (delta: number) => {
-    if (puruEditRef.current || vectorEditRef.current) return;
+    if (frameListRef.current) return;
+    if (puruEditRef.current || vectorEditRef.current || effectEditRef.current || liquidRangeModeRef.current) return;
     if (delta < 0 && !canPrev) return;
     if (delta > 0 && !canNext) return;
     pendingEnter.current = null;
@@ -1360,7 +2047,7 @@ export function Lightbox({
   };
 
   const engageTilt = () => {
-    if (tiltHold.current || puruEditRef.current || vectorEditRef.current || editingRef.current) return;
+    if (tiltHold.current || puruEditRef.current || vectorEditRef.current || effectEditRef.current || editingRef.current) return;
     const stage = stageRef.current;
     let current: Tilt = TILT_REST;
     if (stage?.classList.contains("is-settling") || stage?.classList.contains("is-recoil")) {
@@ -1376,7 +2063,7 @@ export function Lightbox({
   };
 
   const followTilt = (dx: number, dy: number) => {
-    if (puruEditRef.current || vectorEditRef.current || editingRef.current) return;
+    if (puruEditRef.current || vectorEditRef.current || effectEditRef.current || editingRef.current) return;
     engageTilt();
     const stage = stageRef.current;
     const base = tiltHold.current;
@@ -1880,6 +2567,7 @@ export function Lightbox({
   };
 
   const beginSwipe = (event: ReactPointerEvent<HTMLElement>) => {
+    if (liquidRangeModeRef.current) return;
     if (event.button !== 0 || event.pointerType === "mouse") return;
     const target = event.target as Element | null;
     if (target?.closest("button, a, input, textarea")) return;
@@ -2015,6 +2703,7 @@ export function Lightbox({
 
   const hoverTick = () => {
     hoverFrame.current = 0;
+    if (dotStudioRef.current) return;
     if (rubberMode.current !== "idle" || phoneRef.current) return;
     const next = thumbFollow(hoverShown.current, hoverTarget.current);
     hoverShown.current = next;
@@ -2053,6 +2742,10 @@ export function Lightbox({
     let last = performance.now();
     const tick = (now: number) => {
       if (gen !== rubberGen.current) return;
+      if (dotStudioRef.current) {
+        rubberFrame.current = 0;
+        return;
+      }
       current = rubberStep(current, now - last);
       last = now;
       if (rubberResting(current)) {
@@ -2067,7 +2760,7 @@ export function Lightbox({
   };
 
   const onPcHover = (event: ReactPointerEvent<HTMLElement>) => {
-    if (liquidModeRef.current || event.pointerType !== "mouse" || phoneRef.current || puruEditRef.current || vectorEditRef.current || editingRef.current) return;
+    if (dotStudioRef.current || liquidModeRef.current || event.pointerType !== "mouse" || phoneRef.current || puruEditRef.current || vectorEditRef.current || effectEditRef.current || editingRef.current) return;
     lastPointer.current = { x: event.clientX, y: event.clientY };
     if (rubberMode.current !== "idle" || motionReduced()) return;
     hoverTarget.current = overFrame(lastPointer.current) ? tiltAtPoint(lastPointer.current) : THUMB_REST;
@@ -2085,7 +2778,7 @@ export function Lightbox({
   const beginPcTilt = (event: ReactPointerEvent<HTMLElement>) => {
     if (liquidModeRef.current) return;
     if (event.button !== 0 || event.pointerType === "touch") return;
-    if (puruEditRef.current || vectorEditRef.current || editingRef.current) return;
+    if (puruEditRef.current || vectorEditRef.current || effectEditRef.current || editingRef.current) return;
     const target = event.target;
     if (!(target instanceof Element)) return;
     if (target.closest("button, a, input, textarea, .lightbox-nav, .lightbox-bar, .lightbox-info, .lightbox-anim, .lightbox-voice, .puru-edit, .puru-panel, .vector-field, .ink-tools, .phone-menu")) return;
@@ -2264,7 +2957,7 @@ export function Lightbox({
     function onDragStart(ev: DragEvent) {
       const node = ev.target;
       if (!(node instanceof Node) || !stage?.contains(node)) return;
-      if (!mouse || phoneRef.current || editingRef.current || puruEditRef.current || vectorEditRef.current) {
+      if (!mouse || phoneRef.current || editingRef.current || puruEditRef.current || vectorEditRef.current || effectEditRef.current) {
         ev.preventDefault();
         return;
       }
@@ -2329,7 +3022,7 @@ export function Lightbox({
     !armed.current || event.timeStamp < openedAt.current;
 
   const beginPhone = (event: ReactPointerEvent<HTMLElement>) => {
-    if (puruEditRef.current) {
+    if (puruEditRef.current || liquidRangeModeRef.current) {
       event.stopPropagation();
       return;
     }
@@ -2449,6 +3142,20 @@ export function Lightbox({
   const scrim = phone ? Math.min(scrimForDrag(shownDrag.y, stageBox.height), scrimForPinch(pinchFades, shown.scale)) : 1;
   const motionOn = (phone || pcTools) && animLive;
   const fitted: CSSProperties = { position: "absolute", left: 0, top: 0, width: "100%", height: "100%" };
+  if (item && pixelHold.current.id !== item.id) pixelHold.current = { id: item.id, on: item.mime === "image/gif" };
+  if (item && frame && enlargedPixelView(item.width, item.height, frame.width, frame.height, item.mime === "image/gif")) pixelHold.current.on = true;
+  const pixelView = Boolean(item && item.mime.startsWith("image/") && pixelHold.current.on);
+  const incomingPixel = Boolean(
+    incomingItem &&
+      incomingFrame &&
+      incomingItem.mime.startsWith("image/") &&
+      enlargedPixelView(incomingItem.width, incomingItem.height, incomingFrame.width, incomingFrame.height, incomingItem.mime === "image/gif"),
+  );
+  const incomingStyle: CSSProperties | undefined = incomingFrame
+    ? motionOn
+      ? fitted
+      : mediaStyle(incomingFrame, IDENTITY_ZOOM, true, false, { x: incomingShift, y: 0 }, dragAnim)
+    : undefined;
   const motionWrap = (gesture: CSSProperties, incoming: boolean, node: ReactNode) =>
     motionOn ? (
       <div className={incoming ? "lightbox-motion is-incoming" : "lightbox-motion"} style={gesture}>
@@ -2458,7 +3165,7 @@ export function Lightbox({
       node
     );
   const tiltWrap = (gesture: CSSProperties, node: ReactNode, hit = false) => {
-    const showSheen = hit && !editing && !puruEdit && !vectorEdit;
+    const showSheen = hit && !editing && !puruEdit && !vectorEdit && !effectEdit;
     const body = (
       <>
         {node}
@@ -2487,28 +3194,91 @@ export function Lightbox({
   };
   const toggleZoom = () => {
     const next = !animZoomRef.current;
-    if (next) setAnimHold(false);
+    if (next) {
+      if (!dotStudioRef.current) studioHoldRef.current = false;
+      setAnimHold(false);
+    }
     if (next) armTrack("zoom", zoomOptionCycle(animZoomPaceRef.current));
     animZoomRef.current = next;
     setAnimZoom(next);
   };
   const toggleTwist = () => {
     const next = !animTwistRef.current;
-    if (next) setAnimHold(false);
+    if (next) {
+      if (!dotStudioRef.current) studioHoldRef.current = false;
+      setAnimHold(false);
+    }
     if (next) armTrack("twist", twistCycle(animTwistPaceRef.current));
     animTwistRef.current = next;
     setAnimTwist(next);
   };
   const toggleTilt = (side: AnimTilt) => {
     const next = animTiltRef.current === side ? null : side;
+    if (next) if (!dotStudioRef.current) studioHoldRef.current = false;
     animTiltRef.current = next;
     setAnimTilt(next);
   };
   const pickKind = (kind: AnimKind) => {
+    if (!dotStudioRef.current) {
+      studioHoldRef.current = false;
+      const clock = animClock.current;
+      if (clock.frozen !== null) {
+        clock.origin += performance.now() - clock.frozen;
+        clock.frozen = null;
+      }
+    }
     setAnimHold(false);
     setAnimKind(kind);
   };
+  const noteRangeStop = (channel: "anim" | "vector" | "both") => {
+    const hold = rangeHoldRef.current;
+    if (!hold) return;
+    if (channel !== "vector") hold.anim = false;
+    if (channel !== "anim") hold.vector = false;
+  };
+  const pauseForLiquidRange = () => {
+    if (rangeHoldRef.current) return;
+    const anim = !animHoldRef.current && (animKindRef.current !== null || animZoomRef.current || animTwistRef.current);
+    const vector = vectorPlayRef.current;
+    rangeHoldRef.current = { anim, vector };
+    if (anim) {
+      animHoldRef.current = true;
+      setAnimHold(true);
+    }
+    if (!vector) return;
+    vectorPlayRef.current = false;
+    vectorDriveRef.current = { playing: false, origin: vectorOriginRef.current, markers: vectorMarkersRef.current };
+    setVectorPlay(false);
+    setVectorShown(false);
+  };
+  const resumeLiquidRange = () => {
+    if (dotStudioRef.current) return;
+    const hold = rangeHoldRef.current;
+    rangeHoldRef.current = null;
+    if (!hold) return;
+    if (hold.anim) {
+      const configured = animKindRef.current !== null || animZoomRef.current || animTwistRef.current;
+      const live = !animHoldRef.current && configured;
+      if (configured && !live) {
+        animHoldRef.current = false;
+        setAnimHold(false);
+      }
+    }
+    if (!hold.vector || vectorPlayRef.current || vectorMarkersRef.current.length === 0) return;
+    vectorRecallRef.current = false;
+    vectorHoldRef.current = false;
+    vectorOriginRef.current = performance.now();
+    vectorPlayRef.current = true;
+    vectorDriveRef.current = { playing: true, origin: vectorOriginRef.current, markers: vectorMarkersRef.current };
+    vectorEditRef.current = false;
+    setVectorEdit(false);
+    setVectorShown(false);
+    setVectorPlay(true);
+  };
   const stopAnimation = () => {
+    if (!dotStudioRef.current) studioHoldRef.current = false;
+    noteRangeStop("anim");
+    animHoldRef.current = false;
     setAnimHold(false);
     animKindRef.current = null;
     animZoomRef.current = false;
@@ -2607,35 +3377,75 @@ export function Lightbox({
       return null;
     }
   };
-  const playVoice = (id: string) => {
+  const playVoice = (id: string, force = false) => {
+    if (dotStudioRef.current) return;
     const audio = audioRef.current;
     const track = VOICE_TRACKS.find((entry) => entry.id === id);
     if (!audio || !track) {
       setVoiceError("この音声は再生できませんでした");
       return;
     }
-    if (voiceIdRef.current === id && audio.src && !audio.paused) return;
+    if (!force && voiceIdRef.current === id && audio.src && !audio.paused) return;
+    voiceWaitRef.current?.();
+    voiceWaitRef.current = null;
+    const gen = ++voiceGen.current;
     setVoiceError(null);
-    const switching = voiceIdRef.current !== id;
+    const switching = voiceIdRef.current !== id || force || !audio.src;
     voiceIdRef.current = id;
     setVoiceId(id);
     audio.loop = true;
+    const ctx = ensureVoiceGraph();
+    applyVolume(volumeRef.current);
+    applyVoiceRate(audio, voiceRateRef.current);
+    if (ctx) void ctx.resume().catch(() => undefined);
+    let began = false;
+    const detach = () => {
+      audio.removeEventListener("canplay", onReady);
+      audio.removeEventListener("error", onMiss);
+      if (voiceWaitRef.current === detach) voiceWaitRef.current = null;
+    };
+    const start = () => {
+      if (began) return;
+      began = true;
+      detach();
+      if (voiceGen.current !== gen) return;
+      void audio.play().then(
+        () => {
+          if (voiceGen.current !== gen) return;
+        },
+        () => {
+          if (voiceGen.current !== gen) return;
+          setVoiceError("再生できませんでした。もう一度選んでください");
+        },
+      );
+    };
+    const onReady = () => start();
+    const onMiss = () => {
+      if (began) return;
+      began = true;
+      detach();
+      if (voiceGen.current !== gen) return;
+      setVoiceError("再生できませんでした。もう一度選んでください");
+    };
+    voiceWaitRef.current = detach;
+    audio.addEventListener("canplay", onReady);
+    audio.addEventListener("error", onMiss);
     if (switching) {
       audio.pause();
+      audio.preload = "auto";
       audio.src = track.src;
+      try {
+        audio.load();
+      } catch {
+        /* the element still loads from the src assignment */
+      }
       try {
         audio.currentTime = 0;
       } catch {
         /* the new file starts at the beginning once it loads */
       }
     }
-    const ctx = ensureVoiceGraph();
-    applyVolume(volumeRef.current);
-    applyVoiceRate(audio, voiceRateRef.current);
-    void ctx?.resume();
-    void audio.play().catch(() => {
-      setVoiceError("再生できませんでした。もう一度選んでください");
-    });
+    if (audio.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) start();
   };
   const chooseVoiceRate = (rate: VoiceRate) => {
     voiceRateRef.current = rate;
@@ -2646,6 +3456,9 @@ export function Lightbox({
     applyVoiceRate(audio, rate);
   };
   const stopVoice = () => {
+    voiceWaitRef.current?.();
+    voiceWaitRef.current = null;
+    voiceGen.current += 1;
     voiceIdRef.current = null;
     setVoiceId(null);
     setVoiceError(null);
@@ -2659,6 +3472,12 @@ export function Lightbox({
     }
   };
   const stopTogether = () => {
+    if (!dotStudioRef.current) studioHoldRef.current = false;
+    noteRangeStop("both");
+    voiceWaitRef.current?.();
+    voiceWaitRef.current = null;
+    voiceGen.current += 1;
+    animHoldRef.current = true;
     setAnimHold(true);
     const stage = stageRef.current;
     puruDriveRef.current = { x: 0, y: 0, scale: 1, t: 0 };
@@ -2679,18 +3498,238 @@ export function Lightbox({
     }
     vectorHoldRef.current = false;
     const recall = vectorRecallRef.current;
-    if (!vectorPlayRef.current) return;
+    effectPreviewRef.current = false;
+    setEffectPreview(false);
+    if (!vectorPlayRef.current && !effectPlayRef.current) return;
     vectorRecallRef.current = false;
     vectorPlayRef.current = false;
+    effectPlayRef.current = false;
+    markerHoldRef.current = null;
     vectorDriveRef.current = { playing: false, origin: vectorOriginRef.current, markers: vectorMarkersRef.current };
     setVectorPlay(false);
+    setEffectPlay(false);
     setVectorShown(vectorShownAfterStop(recall ? "favorite" : "marker", phoneRef.current, vectorMarkersRef.current.length));
   };
-  const savePlay = () => {
-    if (!item) return;
+  const publishMarkerError = () => {
+    setMarkerSaveError(puruFailedRef.current || vectorFailedRef.current || effectFailedRef.current ? "マーカーを保存できませんでした。" : "");
+  };
+  const flushPuru = () => {
+    window.clearTimeout(puruSaveTimer.current);
+    puruSaveTimer.current = 0;
+    const id = shownIdRef.current;
+    if (!id) return;
+    const markers = puruMarkersRef.current.map((marker) => ({ ...marker }));
+    const key = JSON.stringify(markers);
+    if (key === puruSavedRef.current) return;
+    const gen = ++puruSaveGen.current;
+    puruSavedRef.current = key;
+    void saveImagePuru(id, markers).then((ok) => {
+      if (gen !== puruSaveGen.current || shownIdRef.current !== id) return;
+      if (ok) {
+        if (puruSavedRef.current === key) puruFailedRef.current = false;
+      } else if (puruSavedRef.current === key) {
+        puruSavedRef.current = "";
+        puruFailedRef.current = true;
+      }
+      publishMarkerError();
+    });
+  };
+  const flushVectors = () => {
+    window.clearTimeout(vectorSaveTimer.current);
+    vectorSaveTimer.current = 0;
+    const id = shownIdRef.current;
+    if (!id) return;
+    const markers = vectorMarkersRef.current.map((marker) => ({ ...marker }));
+    const key = JSON.stringify(markers);
+    if (key === vectorSavedRef.current) return;
+    const gen = ++vectorSaveGen.current;
+    vectorSavedRef.current = key;
+    void saveImageVectors(id, markers).then((ok) => {
+      if (gen !== vectorSaveGen.current || shownIdRef.current !== id) return;
+      if (ok) {
+        if (vectorSavedRef.current === key) vectorFailedRef.current = false;
+      } else if (vectorSavedRef.current === key) {
+        vectorSavedRef.current = "";
+        vectorFailedRef.current = true;
+      }
+      publishMarkerError();
+    });
+  };
+  const flushEffects = () => {
+    window.clearTimeout(effectSaveTimer.current);
+    effectSaveTimer.current = 0;
+    const id = shownIdRef.current;
+    if (!id) return;
+    const markers = effectMarkersRef.current.map((marker) => ({ ...marker }));
+    const key = JSON.stringify(markers);
+    if (key === effectSavedRef.current) return;
+    const gen = ++effectSaveGen.current;
+    effectSavedRef.current = key;
+    void saveImageEffects(id, markers).then((ok) => {
+      if (gen !== effectSaveGen.current || shownIdRef.current !== id) return;
+      if (ok) {
+        if (effectSavedRef.current === key) effectFailedRef.current = false;
+      } else if (effectSavedRef.current === key) {
+        effectSavedRef.current = "";
+        effectFailedRef.current = true;
+      }
+      publishMarkerError();
+    });
+  };
+  flushPuruRef.current = flushPuru;
+  flushVectorsRef.current = flushVectors;
+  flushEffectsRef.current = flushEffects;
+  const cancelFavorite = () => {
+    if (playConfirming.current) return;
+    playAskRef.current = null;
+    playAskIdRef.current = null;
+    setPlayAsk(null);
+    setPlayAskSaved(false);
+  };
+  cancelFavoriteRef.current = cancelFavorite;
+  const confirmFavorite = () => {
+    const play = playAskRef.current;
+    const id = playAskIdRef.current;
+    if (!play || !id || playConfirming.current) return;
+    if (shownIdRef.current !== id) {
+      cancelFavorite();
+      return;
+    }
+    playConfirming.current = true;
+    flushPuru();
     flushVectors();
-    const had = normalizeImagePlay(item.play) !== null;
-    const play = {
+    flushEffects();
+    void saveImagePlay(id, play).then((ok) => {
+      playConfirming.current = false;
+      playAskRef.current = null;
+      playAskIdRef.current = null;
+      setPlayAsk(null);
+      setPlayAskSaved(false);
+      if (!ok || shownIdRef.current !== id) {
+        if (shownIdRef.current === id) setPlayNote("登録できませんでした");
+        return;
+      }
+      setPlayNote("登録しました");
+    });
+  };
+  const clearFavorite = () => {
+    const id = playAskIdRef.current;
+    if (!id || playConfirming.current) return;
+    if (shownIdRef.current !== id) {
+      cancelFavorite();
+      return;
+    }
+    playConfirming.current = true;
+    void clearImagePlay(id).then((ok) => {
+      playConfirming.current = false;
+      playAskRef.current = null;
+      playAskIdRef.current = null;
+      setPlayAsk(null);
+      setPlayAskSaved(false);
+      if (shownIdRef.current !== id) return;
+      if (ok) {
+        liquidRangesRef.current = [];
+        liquidHidesRef.current = [];
+        setLiquidRanges([]);
+        setLiquidHides([]);
+        liquidPickRef.current = null;
+        setLiquidPick(null);
+        setRangeDraft(null);
+        setHideDraft(null);
+      }
+      setPlayNote(ok ? "解除しました" : "解除できませんでした");
+    });
+  };
+  const exportSavedGif = () => {
+    if (phoneRef.current || gifAbort.current) return;
+    const current = itemRef.current;
+    const play = current ? normalizeImagePlay(current.play) : null;
+    if (!current || !play) return;
+    if (!current.mime.startsWith("image/") || current.mime.startsWith("image/svg")) {
+      setPlayNote("この画像はGIF化できません");
+      return;
+    }
+    const image = mediaRef.current;
+    if (!(image instanceof HTMLImageElement) || image.naturalWidth < 2 || image.naturalHeight < 2) {
+      setPlayNote("画像の準備ができていません");
+      return;
+    }
+    const open = gifSavePicker();
+    if (!open || !canSaveGif()) {
+      setPlayNote("この環境では保存ダイアログを開けません");
+      return;
+    }
+    const raw = current.play;
+    const restoreEffects = !!raw && typeof raw === "object" && "effects" in raw;
+    const puru = puruMarkersRef.current.map((marker) => ({ ...marker }));
+    const vectors = play.vector ? vectorMarkersRef.current.map((marker) => ({ ...marker })) : [];
+    const effects = (play.effect ? (restoreEffects ? play.effects : effectMarkersRef.current) : []).map((marker) => ({ ...marker }));
+    const saved = play;
+    const name = current.name;
+    const controller = new AbortController();
+    gifAbort.current = controller;
+    cancelFavorite();
+    setGifJob({ stage: "保存先を選択", percent: 0 });
+    const pending = runGifExportSave({
+      suggestedName: name,
+      open,
+      signal: controller.signal,
+      stop: () => controller.abort(),
+      onWrite: () => {
+        if (!controller.signal.aborted) setGifJob({ stage: "保存", percent: 96 });
+      },
+      render: async (saveId) => {
+        let bitmap: ImageBitmap | null = null;
+        try {
+          bitmap = await createImageBitmap(image);
+          if (controller.signal.aborted) throw new DOMException("The operation was aborted.", "AbortError");
+          return await renderFavoriteGif({
+            image: bitmap,
+            natural: { width: bitmap.width, height: bitmap.height },
+            play: saved,
+            puru,
+            vectors,
+            effects,
+            signal: controller.signal,
+            saveId,
+            dotCols: activeDot(current.dot).cols,
+            dotColors: activeDot(current.dot).colors,
+            frames: gifFrames,
+            dotByDot: gifDotByDot,
+            dotByDotCols: gifDotByDot ? dotView(current.dot).cols : null,
+            dotByDotColors: gifDotByDot && dotView(current.dot).colorOn ? dotView(current.dot).colors : null,
+            dotRecipe: gifDotByDot ? dotRecipe(current.dot) : null,
+            onProgress: (progress) => {
+              if (!controller.signal.aborted) setGifJob(progress);
+            },
+          });
+        } finally {
+          bitmap?.close();
+        }
+      },
+    });
+    void pending.then(
+      (result) => {
+        if (result === "saved") setPlayNote("GIFを保存しました");
+        else if (result === "cancelled") setPlayNote("保存をやめました");
+        else setPlayNote("この環境では保存ダイアログを開けません");
+      },
+      (error: unknown) => {
+        if (controller.signal.aborted || isSaveCancel(error)) setPlayNote("保存をやめました");
+        else setPlayNote("GIFを保存できませんでした");
+      },
+    ).finally(() => {
+      if (gifAbort.current === controller) gifAbort.current = null;
+      setGifJob(null);
+    });
+  };
+  const askFavorite = () => {
+    if (!item || playAskRef.current || playConfirming.current) return;
+    const saved = normalizeImagePlay(item.play) !== null;
+    flushPuru();
+    flushVectors();
+    flushEffects();
+    const play: ImagePlay = {
       kind: animKindRef.current,
       speed: animSpeedRef.current,
       reverse: animReverseRef.current,
@@ -2699,23 +3738,38 @@ export function Lightbox({
       zoomPace: animZoomPaceRef.current,
       twistPace: animTwistPaceRef.current,
       tilt: animTiltRef.current,
-      vector: vectorPlayRef.current,
+      vector: vectorPlayRef.current && vectorMarkersRef.current.length > 0,
+      effect: effectPlayRef.current && effectMarkersRef.current.length > 0,
+      effects: effectMarkersRef.current.map((marker) => ({ ...marker })),
       voiceId: voiceIdRef.current,
       rate: voiceRateRef.current,
       volume: volumeRef.current,
+      liquid: liquidRangesRef.current.map((range) => ({ ...range })),
+      liquidHide: liquidHidesRef.current.map((hide) => ({ ...hide })),
     };
-    void saveImagePlay(item.id, play).then((ok) => {
-      if (!ok || shownIdRef.current !== item.id) return;
-      setPlayNote(had ? "更新しました" : "登録しました");
-    });
+    const voice = play.voiceId ? (VOICE_TRACKS.find((track) => track.id === play.voiceId)?.label ?? play.voiceId) : null;
+    playAskRef.current = play;
+    playAskIdRef.current = item.id;
+    setPlayAskSaved(saved);
+    setPlayAsk(favoriteAskCopy(play, voice));
   };
-  const recallPlay = () => {
-    if (!item) return;
-    const play = normalizeImagePlay(item.play);
-    if (!play) {
-      setPlayNote("お気に入りは未登録です");
-      return;
-    }
+  const silencePlayback = () => {
+    rangeHoldRef.current = null;
+    stopAnimation();
+    stopVoice();
+    vectorRecallRef.current = false;
+    vectorPlayRef.current = false;
+    effectPlayRef.current = false;
+    effectPreviewRef.current = false;
+    markerHoldRef.current = null;
+    vectorDriveRef.current = { playing: false, origin: vectorOriginRef.current, markers: vectorMarkersRef.current };
+    setVectorPlay(false);
+    setEffectPlay(false);
+    setEffectPreview(false);
+    setVectorShown(false);
+  };
+  const startSavedPlay = (play: NonNullable<ReturnType<typeof normalizeImagePlay>>, quiet: boolean, restoreEffects = false) => {
+    if (dotStudioRef.current) return;
     const audio = audioRef.current;
     if (audio) {
       audio.pause();
@@ -2733,6 +3787,7 @@ export function Lightbox({
     animZoomPaceRef.current = play.zoomPace;
     animTwistPaceRef.current = play.twistPace;
     animTiltRef.current = play.tilt;
+    animHoldRef.current = false;
     setAnimHold(false);
     const now = performance.now();
     const clock = animClock.current;
@@ -2760,25 +3815,95 @@ export function Lightbox({
     voiceIdRef.current = null;
     setVoiceId(null);
     setVoiceError(null);
-    if (play.voiceId && VOICE_TRACKS.some((track) => track.id === play.voiceId)) playVoice(play.voiceId);
-    else if (play.voiceId) setVoiceError("この音声は再生できませんでした");
-    if (play.vector && vectorMarkersRef.current.length > 0) {
-      vectorRecallRef.current = true;
-      vectorOriginRef.current = performance.now();
-      vectorPlayRef.current = true;
-      vectorDriveRef.current = { playing: true, origin: vectorOriginRef.current, markers: vectorMarkersRef.current };
+    if (play.voiceId && VOICE_TRACKS.some((track) => track.id === play.voiceId)) {
+      const voiceId = play.voiceId;
+      const launch = () => {
+        if (audioRef.current) playVoice(voiceId, true);
+        else {
+          const gen = voiceGen.current;
+          const imageId = shownIdRef.current;
+          window.requestAnimationFrame(() => {
+            if (voiceGen.current !== gen || shownIdRef.current !== imageId) return;
+            playVoice(voiceId, true);
+          });
+        }
+      };
+      launch();
+    } else if (play.voiceId) setVoiceError("この音声は再生できませんでした");
+    if (restoreEffects) {
+      const restored = play.effects.map((marker) => ({ ...marker }));
+      effectMarkersRef.current = restored;
+      setEffectMarkers(restored);
+      setEffectSelected(restored.length > 0 ? (restored[restored.length - 1]?.id ?? null) : null);
+    }
+    const effectsOn = play.effect && effectMarkersRef.current.length > 0;
+    const vectorsOn = play.vector && vectorMarkersRef.current.length > 0;
+    if (vectorsOn || effectsOn) {
+      vectorRecallRef.current = vectorsOn;
+      const origin = performance.now();
+      vectorOriginRef.current = origin;
+      vectorPlayRef.current = vectorsOn;
+      effectPlayRef.current = effectsOn;
+      vectorDriveRef.current = { playing: vectorsOn, origin, markers: vectorMarkersRef.current };
       vectorEditRef.current = false;
+      effectEditRef.current = false;
       setVectorEdit(false);
+      setEffectEdit(false);
       setVectorShown(false);
-      setVectorPlay(true);
+      setEffectOrigin(origin);
+      setEffectPreview(false);
+      effectPreviewRef.current = false;
+      setVectorPlay(vectorsOn);
+      setEffectPlay(effectsOn);
     } else {
-      if (play.vector) setVectorNote("マーカーがありません");
+      if ((play.vector || play.effect) && !quiet) setVectorNote("マーカーがありません");
       vectorRecallRef.current = false;
       vectorPlayRef.current = false;
+      effectPlayRef.current = false;
+      effectPreviewRef.current = false;
       vectorDriveRef.current = { playing: false, origin: vectorOriginRef.current, markers: vectorMarkersRef.current };
       setVectorPlay(false);
+      setEffectPlay(false);
+      setEffectPreview(false);
     }
-    setPlayNote("呼び出しました");
+    syncGoldSound(
+      goldSoundMode({
+        playing: effectPlayRef.current,
+        preview: false,
+        held: false,
+        goldVisible: effectMarkersRef.current.some((marker) => marker.kind === "gold" && marker.off !== true),
+      }),
+    );
+    if (!quiet) setPlayNote("呼び出しました");
+    liquidRangesRef.current = play.liquid;
+    liquidHidesRef.current = play.liquidHide;
+    setLiquidRanges(play.liquid);
+    setLiquidHides(play.liquidHide);
+    const restoredRange = play.liquid.length > 0 ? play.liquid[play.liquid.length - 1] : null;
+    const restoredHide = play.liquidHide.length > 0 ? play.liquidHide[play.liquidHide.length - 1] : null;
+    const restoredPick =
+      restoredRange?.id != null
+        ? { kind: "range" as const, id: restoredRange.id }
+        : restoredHide?.id != null
+          ? { kind: "hide" as const, id: restoredHide.id }
+          : null;
+    liquidPickRef.current = restoredPick;
+    setLiquidPick(restoredPick);
+    setRangeDraft(null);
+    setHideDraft(null);
+  };
+  const recallPlay = () => {
+    if (dotStudioRef.current) return;
+    const current = itemRef.current;
+    if (!current) return;
+    const play = normalizeImagePlay(current.play);
+    if (!play) {
+      setPlayNote("お気に入りは未登録です");
+      return;
+    }
+    const raw = current.play;
+    const restoreEffects = !!raw && typeof raw === "object" && "effects" in raw;
+    startSavedPlay(play, false, restoreEffects);
   };
   const puruFrame = () => {
     const node = document.querySelector(".puru-edit-fx");
@@ -2788,8 +3913,12 @@ export function Lightbox({
     const node = document.querySelector(".vector-field") ?? document.querySelector(".lightbox-stage img");
     return node instanceof HTMLElement ? node.getBoundingClientRect() : null;
   };
+  const effectSurface = () => {
+    const node = document.querySelector(".effect-field") ?? document.querySelector(".lightbox-stage img");
+    return node instanceof HTMLElement ? node.getBoundingClientRect() : null;
+  };
   const menuCovers = (x: number, y: number) => {
-    const nodes = document.querySelectorAll(".puru-panel, .puru-kind-row, .puru-bar-actions, .vector-kind-row, .lightbox-anim, .marker-list");
+    const nodes = document.querySelectorAll(".puru-panel, .puru-kind-row, .puru-bar-actions, .vector-kind-row, .effect-kind-row, .lightbox-anim, .marker-list");
     for (const node of nodes) {
       if (!(node instanceof HTMLElement)) continue;
       const rect = node.getBoundingClientRect();
@@ -2797,18 +3926,8 @@ export function Lightbox({
     }
     return false;
   };
-  const flushVectors = () => {
-    const id = shownIdRef.current;
-    if (!id) return;
-    const markers = vectorMarkersRef.current.map((marker) => ({ ...marker }));
-    const key = JSON.stringify(markers);
-    if (key === vectorSavedRef.current) return;
-    vectorSavedRef.current = key;
-    void saveImageVectors(id, markers).then((ok) => {
-      if (!ok && shownIdRef.current === id && vectorSavedRef.current === key) vectorSavedRef.current = "";
-    });
-  };
   const closePuru = (keepHold = false) => {
+    flushPuru();
     puruEditRef.current = false;
     puruPointers.current.clear();
     puruPinch.current = null;
@@ -2817,31 +3936,72 @@ export function Lightbox({
     puruGhostRef.current = null;
     setPuruGhost(null);
     setPuruEdit(false);
-    if (!keepHold && !vectorEditRef.current) resumeVectorHold();
+    if (!keepHold && !vectorEditRef.current && !effectEditRef.current) resumeVectorHold();
   };
   const pauseVectorForEdit = () => {
-    if (!vectorPlayRef.current) return;
+    if (!vectorPlayRef.current && !effectPlayRef.current) return;
+    markerHoldRef.current = { vector: vectorPlayRef.current, effect: effectPlayRef.current };
     vectorHoldRef.current = true;
     vectorPlayRef.current = false;
+    effectPlayRef.current = false;
     vectorDriveRef.current = { playing: false, origin: vectorOriginRef.current, markers: vectorMarkersRef.current };
     setVectorPlay(false);
+    setEffectPlay(false);
+    syncGoldSound(
+      goldSoundMode({
+        playing: false,
+        preview: effectPreviewRef.current,
+        held: markerHoldRef.current?.effect === true,
+        goldVisible: effectMarkersRef.current.some((marker) => marker.kind === "gold" && marker.off !== true),
+      }),
+    );
   };
-  const resumeVectorHold = () => {
+  const resumeVectorHold = (allowPhone = false) => {
     if (!vectorHoldRef.current) return;
+    const held = markerHoldRef.current;
     vectorHoldRef.current = false;
-    if (phoneRef.current || vectorPlayRef.current || vectorMarkersRef.current.length === 0) return;
-    vectorOriginRef.current = performance.now();
-    vectorPlayRef.current = true;
-    vectorDriveRef.current = { playing: true, origin: vectorOriginRef.current, markers: vectorMarkersRef.current };
+    markerHoldRef.current = null;
+    const vector = !!held?.vector && vectorMarkersRef.current.length > 0;
+    const effect = !!held?.effect && effectMarkersRef.current.length > 0;
+    if (vectorPlayRef.current || effectPlayRef.current) return;
+    if ((!allowPhone && phoneRef.current) || (!vector && !effect)) {
+      syncGoldSound("stop");
+      return;
+    }
+    const origin = performance.now();
+    vectorOriginRef.current = origin;
+    vectorPlayRef.current = vector;
+    effectPlayRef.current = effect;
+    vectorDriveRef.current = { playing: vector, origin, markers: vectorMarkersRef.current };
     vectorEditRef.current = false;
+    effectEditRef.current = false;
+    effectPreviewRef.current = false;
     setVectorEdit(false);
-    setVectorPlay(true);
+    setEffectEdit(false);
+    setEffectPreview(false);
+    setVectorShown(false);
+    setEffectOrigin(origin);
+    setVectorPlay(vector);
+    setEffectPlay(effect);
+    syncGoldSound(
+      goldSoundMode({
+        playing: effect,
+        preview: false,
+        held: false,
+        goldVisible: effectMarkersRef.current.some((marker) => marker.kind === "gold" && marker.off !== true),
+      }),
+    );
   };
   const openPuru = () => {
     flushVectors();
+    flushEffects();
     pauseVectorForEdit();
     vectorEditRef.current = false;
     setVectorEdit(false);
+    effectEditRef.current = false;
+    effectPreviewRef.current = false;
+    setEffectEdit(false);
+    setEffectPreview(false);
     window.cancelAnimationFrame(zoomFrame.current);
     window.clearTimeout(zoomTimer.current);
     window.cancelAnimationFrame(dragFrame.current);
@@ -2872,16 +4032,28 @@ export function Lightbox({
     flushVectors();
     vectorEditRef.current = false;
     setVectorEdit(false);
-    if (!keepHold && !puruEditRef.current) resumeVectorHold();
+    if (!keepHold && !puruEditRef.current && !effectEditRef.current) resumeVectorHold();
+  };
+  const closeEffect = (keepHold = false) => {
+    flushEffects();
+    effectEditRef.current = false;
+    effectPreviewRef.current = false;
+    effectGhostRef.current = null;
+    setEffectEdit(false);
+    setEffectPreview(false);
+    setEffectGhost(null);
+    if (!keepHold && !puruEditRef.current && !vectorEditRef.current) resumeVectorHold(true);
   };
   const openVector = () => {
-    const wasPlaying = vectorPlayRef.current;
+    if (phoneRef.current) return;
+    const wasPlaying = vectorPlayRef.current || effectPlayRef.current;
     if (wasPlaying) pauseVectorForEdit();
     if (vectorEditRef.current && !wasPlaying) {
       closeVector();
       return;
     }
     closePuru(true);
+    closeEffect(true);
     vectorEditRef.current = true;
     if (hoverFrame.current) {
       window.cancelAnimationFrame(hoverFrame.current);
@@ -2913,42 +4085,107 @@ export function Lightbox({
     setVoiceRateOpen(false);
     setHot(null);
   };
+  const settleMarkerFrame = () => {
+    if (hoverFrame.current) {
+      window.cancelAnimationFrame(hoverFrame.current);
+      hoverFrame.current = 0;
+    }
+    clearRubber();
+    window.cancelAnimationFrame(zoomFrame.current);
+    window.clearTimeout(zoomTimer.current);
+    window.cancelAnimationFrame(dragFrame.current);
+    window.clearTimeout(dragTimer.current);
+    zoomRef.current = IDENTITY_ZOOM;
+    dragRef.current = DRAG_REST;
+    gestureRef.current = freshGesture();
+    setZoomAnim(false);
+    setDragAnim(false);
+    setZoom(IDENTITY_ZOOM);
+    setDrag(DRAG_REST);
+    const stage = stageRef.current;
+    if (stage) {
+      stage.style.setProperty("--fx-x", "0px");
+      stage.style.setProperty("--fx-y", "0px");
+      stage.style.setProperty("--fx-s", "1");
+      stage.style.setProperty("--fx-r", "0deg");
+    }
+    setAnimMenu(false);
+    setVoiceMenu(false);
+    setVoiceRateOpen(false);
+    setHot(null);
+  };
+  const openEffect = () => {
+    if (phoneRef.current) return;
+    const wasPlaying = vectorPlayRef.current || effectPlayRef.current;
+    if (wasPlaying) pauseVectorForEdit();
+    if (effectEditRef.current && !wasPlaying) {
+      closeEffect();
+      return;
+    }
+    closePuru(true);
+    closeVector(true);
+    effectPreviewRef.current = false;
+    setEffectPreview(false);
+    effectEditRef.current = true;
+    settleMarkerFrame();
+    void primeEffectAssets();
+    setEffectEdit(true);
+  };
   const patchVector = (id: number, patch: Partial<Pick<VectorMarker, "u" | "v" | "view" | "angle" | "span">>) => {
     setVectorMarkers((list) => list.map((marker) => (marker.id === id ? { ...marker, ...patch } : marker)));
   };
   const toggleVectorPlay = () => {
-    if (!vectorPlayRef.current && vectorMarkersRef.current.length === 0) {
+    if (dotStudioRef.current) return;
+    const vectors = vectorMarkersRef.current.length > 0;
+    const effects = effectMarkersRef.current.length > 0;
+    const live = vectorPlayRef.current || effectPlayRef.current;
+    if (!live && !vectors && !effects) {
       setVectorNote("マーカーがありません");
       return;
     }
-    if (vectorPlayRef.current) {
+    if (live) {
+      noteRangeStop("vector");
       vectorHoldRef.current = false;
+      markerHoldRef.current = null;
       const recall = vectorRecallRef.current;
       vectorRecallRef.current = false;
       vectorPlayRef.current = false;
+      effectPlayRef.current = false;
+      effectPreviewRef.current = false;
       vectorDriveRef.current = { playing: false, origin: vectorOriginRef.current, markers: vectorMarkersRef.current };
       setVectorPlay(false);
+      setEffectPlay(false);
+      setEffectPreview(false);
       setVectorShown(vectorShownAfterStop(recall ? "favorite" : "marker", phoneRef.current, vectorMarkersRef.current.length));
+      syncGoldSound("stop");
       return;
     }
     vectorRecallRef.current = false;
     vectorHoldRef.current = false;
-    vectorOriginRef.current = performance.now();
-    vectorPlayRef.current = true;
-    vectorDriveRef.current = { playing: true, origin: vectorOriginRef.current, markers: vectorMarkersRef.current };
+    markerHoldRef.current = null;
+    const origin = performance.now();
+    vectorOriginRef.current = origin;
+    vectorPlayRef.current = vectors;
+    effectPlayRef.current = effects;
+    vectorDriveRef.current = { playing: vectors, origin, markers: vectorMarkersRef.current };
     vectorEditRef.current = false;
+    effectEditRef.current = false;
+    effectPreviewRef.current = false;
     setVectorEdit(false);
-    setVectorPlay(true);
-  };
-  const saveVectors = () => {
-    const id = shownIdRef.current;
-    if (!id) return;
-    const markers = vectorMarkersRef.current.map((marker) => ({ ...marker }));
-    void saveImageVectors(id, markers).then((ok) => {
-      if (!ok || shownIdRef.current !== id) return;
-      vectorSavedRef.current = JSON.stringify(markers);
-      setVectorNote("保存しました");
-    });
+    setEffectEdit(false);
+    setEffectPreview(false);
+    setVectorShown(false);
+    setEffectOrigin(origin);
+    setVectorPlay(vectors);
+    setEffectPlay(effects);
+    syncGoldSound(
+      goldSoundMode({
+        playing: effects,
+        preview: false,
+        held: false,
+        goldVisible: effectMarkersRef.current.some((marker) => marker.kind === "gold" && marker.off !== true),
+      }),
+    );
   };
   const onPcPuruDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -3211,14 +4448,248 @@ export function Lightbox({
     vectorGhostRef.current = null;
     setVectorGhost(null);
   };
+  const onEffectPaceDown = (kind: EffectKind, pace: EffectPace, event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0) return;
+    event.stopPropagation();
+    event.preventDefault();
+    effectGhostRef.current = { kind, pace, id: event.pointerId, x: event.clientX, y: event.clientY };
+    setEffectGhost(null);
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      /* the drag can still finish on pointerup */
+    }
+  };
+  const onEffectPaceMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const ghost = effectGhostRef.current;
+    if (!ghost || ghost.id !== event.pointerId) return;
+    event.stopPropagation();
+    if (Math.hypot(event.clientX - ghost.x, event.clientY - ghost.y) < 8) return;
+    const rect = effectSurface();
+    const point = rect ? imagePoint(event.clientX, event.clientY, rect) : { inside: false };
+    const asset = EFFECT_KIND_ASSETS[ghost.kind][0];
+    const draw = rect && asset ? effectDrawSize({ asset, size: EFFECT_SIZE_DEFAULT }, rect) : { w: 96, h: 64 };
+    setEffectGhost({
+      kind: ghost.kind,
+      pace: ghost.pace,
+      x: event.clientX,
+      y: event.clientY,
+      inside: point.inside && !menuCovers(event.clientX, event.clientY),
+      w: draw.w,
+      h: draw.h,
+    });
+  };
+  const onEffectPaceUp = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const ghost = effectGhostRef.current;
+    if (!ghost || ghost.id !== event.pointerId) return;
+    event.stopPropagation();
+    effectGhostRef.current = null;
+    setEffectGhost(null);
+    const dragged = Math.hypot(event.clientX - ghost.x, event.clientY - ghost.y) >= 8;
+    effectPaceRef.current = ghost.pace;
+    setEffectPace(ghost.pace);
+    setEffectKind(ghost.kind);
+    const asset = EFFECT_KIND_ASSETS[ghost.kind][0];
+    if (!asset) return;
+    if (!dragged) {
+      const selected = effectSelected;
+      if (selected !== null) {
+        setEffectMarkers((list) =>
+          list.map((marker) => (marker.id === selected ? { ...marker, kind: ghost.kind, asset, pace: ghost.pace } : marker)),
+        );
+      }
+      return;
+    }
+    const rect = effectSurface();
+    if (!rect || menuCovers(event.clientX, event.clientY)) return;
+    const point = imagePoint(event.clientX, event.clientY, rect);
+    if (!point.inside) return;
+    const placed = nextEffectId(effectMarkersRef.current);
+    const marker: EffectMarker = {
+      id: placed,
+      kind: ghost.kind,
+      asset,
+      pace: ghost.pace,
+      u: point.u,
+      v: point.v,
+      size: EFFECT_SIZE_DEFAULT,
+      angle: 0,
+    };
+    const next = [...effectMarkersRef.current, marker];
+    effectMarkersRef.current = next;
+    setEffectMarkers(next.map((entry) => ({ ...entry })));
+    setEffectSelected(placed);
+  };
+  const onEffectPaceCancel = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (effectGhostRef.current?.id !== event.pointerId) return;
+    effectGhostRef.current = null;
+    setEffectGhost(null);
+  };
   const puruAvailable = !phone && pcTools && !!item && !item.animated;
   const puruLive = (phone || pcTools) && !!item && !item.animated && puruMarkers.length > 0;
   const pokeMesh = !phone && !!item && !item.animated && item.mime.startsWith("image/");
   const meshOn = puruLive || pokeMesh;
   const handMesh = !phone && puruMarkers.length > 0 && (gestureOn || pokeOn);
   const meshShown = (puruLive && puruDrawn) || (handMesh && meshReady);
+  const studioProcessed = !dotRecord || typeof dotRecord.show !== "boolean" ? true : dotRecord.show;
+  const studioHasPaint = dotMosaic || dotColorOn || !recipeIsPlain(dotRecipeLive);
+  // The mesh being up must not unmount the only visible picture. Hover turns
+  // handMesh on, and a hidden-mode puru image is already meshShown.
+  const studioFilterOn = Boolean(dotStudio && !phone && studioProcessed && studioHasPaint);
   const clickCover = pokeOn && meshReady && !meshShown;
   const selectedMarker = puruMarkers.find((marker) => marker.id === puruSelected) ?? null;
+  const removePuruMarker = (id: number) => {
+    setPuruMarkers((list) => list.filter((marker) => marker.id !== id));
+    setPuruSelected((current) => (current === id ? null : current));
+  };
+  const removeVectorMarker = (id: number) => {
+    setVectorMarkers((list) => list.filter((marker) => marker.id !== id));
+    setVectorSelected((current) => (current === id ? null : current));
+  };
+  const removeEffectMarker = (id: number) => {
+    setEffectMarkers((list) => list.filter((marker) => marker.id !== id));
+    setEffectSelected((current) => (current === id ? null : current));
+  };
+  const patchEffect = (id: number, patch: Partial<Pick<EffectMarker, "u" | "v" | "size" | "angle" | "pace">>) => {
+    setEffectMarkers((list) => list.map((marker) => (marker.id === id ? { ...marker, ...patch } : marker)));
+  };
+  const parkMarker = <T extends { off?: boolean }>(marker: T): T => {
+    if (!marker.off) return { ...marker, off: true };
+    const next = { ...marker };
+    delete next.off;
+    return next;
+  };
+  const togglePuruMarker = (id: number) => {
+    setPuruMarkers((list) => list.map((marker) => (marker.id === id ? parkMarker(marker) : marker)));
+  };
+  const toggleVectorMarker = (id: number) => {
+    setVectorMarkers((list) => list.map((marker) => (marker.id === id ? parkMarker(marker) : marker)));
+  };
+  const flipBackbeat = <T extends { backbeat?: boolean }>(marker: T): T => {
+    if (marker.backbeat !== true) return { ...marker, backbeat: true };
+    const next = { ...marker };
+    delete next.backbeat;
+    return next;
+  };
+  const toggleEffectPreview = () => {
+    if (dotStudioRef.current) return;
+    if (!effectEditRef.current || effectMarkersRef.current.length === 0) return;
+    const next = !effectPreviewRef.current;
+    effectPreviewRef.current = next;
+    if (next) setEffectOrigin(performance.now());
+    setEffectPreview(next);
+    syncGoldSound(
+      goldSoundMode({
+        playing: effectPlayRef.current,
+        preview: next,
+        held: markerHoldRef.current?.effect === true,
+        goldVisible: effectMarkersRef.current.some((marker) => marker.kind === "gold" && marker.off !== true),
+      }),
+    );
+  };
+  const toggleVectorBackbeat = (id: number) => {
+    setVectorMarkers((list) => list.map((marker) => (marker.id === id ? flipBackbeat(marker) : marker)));
+  };
+  const toggleEffectMarker = (id: number) => {
+    setEffectMarkers((list) => list.map((marker) => (marker.id === id ? parkMarker(marker) : marker)));
+  };
+  const toggleEffectBackbeat = (id: number) => {
+    setEffectMarkers((list) => list.map((marker) => (marker.id === id ? flipBackbeat(marker) : marker)));
+  };
+  const toggleEffectFlip = () => {
+    const id = effectSelected;
+    if (id === null) return;
+    setEffectMarkers((list) => list.map((marker) => (marker.id === id ? { ...marker, ...(marker.flip ? { flip: undefined } : { flip: true }) } : marker)));
+  };
+  const vectorSecondAt = Math.max(0, VECTOR_KINDS.findIndex((kind) => kind.id === "expand"));
+  const vectorKindGroup = (kind: (typeof VECTOR_KINDS)[number]) => (
+    <div key={kind.id} className="vector-kind-group" style={{ ["--vector" as string]: kind.color }} aria-label={kind.label}>
+      <span className="vector-kind-name">{kind.label}</span>
+      {VECTOR_PACES.map((pace) => {
+        const on = vectorArmed?.kind === kind.id && vectorArmed.pace === pace.id;
+        return (
+          <button
+            key={pace.id}
+            type="button"
+            className={on ? "vector-pace is-on" : "vector-pace"}
+            aria-pressed={on}
+            aria-label={`${kind.label} ${pace.label}`}
+            onPointerDown={(event) => onVectorKindDown(kind.id, pace.id, event)}
+            onPointerMove={onVectorKindMove}
+            onPointerUp={onVectorKindUp}
+            onPointerCancel={onVectorKindCancel}
+          >
+            {pace.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+  const effectKindRow = (
+    <div className="effect-kind-row" role="toolbar" aria-label="エフェクトマーカー">
+      {EFFECT_KINDS.map((kind) => (
+        <div key={kind.id} className="vector-kind-group" style={{ ["--vector" as string]: kind.color }} aria-label={kind.label}>
+          <span className="vector-kind-name">{kind.label}</span>
+          {EFFECT_PACES.map((pace) => {
+            const on = effectKind === kind.id && effectPace === pace.id;
+            return (
+              <button
+                key={pace.id}
+                type="button"
+                className={on ? "vector-pace is-on" : "vector-pace"}
+                aria-pressed={on}
+                aria-label={`${kind.label} ${pace.label}`}
+                onPointerDown={(event) => onEffectPaceDown(kind.id, pace.id, event)}
+                onPointerMove={onEffectPaceMove}
+                onPointerUp={onEffectPaceUp}
+                onPointerCancel={onEffectPaceCancel}
+              >
+                {pace.label}
+              </button>
+            );
+          })}
+        </div>
+      ))}
+      <div className="puru-kind-actions">
+        <button
+          type="button"
+          disabled={effectSelected === null}
+          className={effectMarkers.some((marker) => marker.id === effectSelected && marker.flip) ? "is-on" : ""}
+          aria-pressed={effectMarkers.some((marker) => marker.id === effectSelected && marker.flip)}
+          onClick={() => toggleEffectFlip()}
+        >
+          反転
+        </button>
+        <button
+          type="button"
+          disabled={effectSelected === null}
+          onClick={() => {
+            if (effectSelected === null) return;
+            removeEffectMarker(effectSelected);
+          }}
+        >
+          削除
+        </button>
+        <button
+          type="button"
+          className={effectPreview ? "is-on" : ""}
+          aria-pressed={effectPreview}
+          disabled={effectMarkers.length === 0}
+          aria-label={effectPreview ? "テスト再生を停止" : "テスト再生"}
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggleEffectPreview();
+          }}
+        >
+          {effectPreview ? "停止" : "再生"}
+        </button>
+        <button type="button" onClick={() => closeEffect()}>
+          終了
+        </button>
+      </div>
+    </div>
+  );
   const optionPaces = [
     ["slow", "遅"],
     ["normal", "普通"],
@@ -3251,13 +4722,499 @@ export function Lightbox({
       </div>
     );
   };
-  const liquidImage = !!item && !item.animated && item.mime.startsWith("image/");
-  const liquidListen = liquidMode && !phone && liquidImage && !puruEdit && !vectorEdit && !editing;
+  const liquidImage = acceptsLiquidImage(item);
+  const liquidListen = liquidMode && !phone && liquidImage && !puruEdit && !vectorEdit && !effectEdit && !editing && !liquidRangeMode && !dotStudio;
+  const primePlayback = () => {
+    unlockLiquidAudio();
+    const audio = audioRef.current;
+    if (!audio || voiceIdRef.current) return;
+    audio.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+    void audio.play().then(() => {
+      if (voiceIdRef.current) return;
+      if (!audio.src.startsWith("data:audio/wav")) return;
+      audio.pause();
+      audio.removeAttribute("src");
+    }).catch(() => undefined);
+  };
+  const paintGate = (title: string, note: string, job: { done: number; total: number; failed: string[]; active?: { id: string; stage: string }[] }, busy: boolean) => {
+    setMediaGate({ title, note, done: job.done, total: job.total, failed: job.failed, active: job.active ?? [], busy });
+  };
+  const finishGate = (
+    tokenRef: { current: number },
+    token: number,
+    note: string,
+    enable: () => void,
+    retry: () => void,
+    job: { done: number; total: number; failed: string[]; ready: boolean },
+  ) => {
+    if (tokenRef === liquidArm) liquidBooting.current = false;
+    if (tokenRef.current !== token || !itemRef.current) return;
+    if (job.ready) {
+      gateRetryRef.current = null;
+      gateProceedRef.current = null;
+      gateCancelRef.current = null;
+      setMediaGate(null);
+      enable();
+      return;
+    }
+    gateRetryRef.current = retry;
+    gateProceedRef.current = () => {
+      if (tokenRef.current !== token || !itemRef.current) return;
+      setMediaGate(null);
+      enable();
+    };
+    gateCancelRef.current = () => {
+      tokenRef.current += 1;
+      setMediaGate(null);
+    };
+    setMediaGate({
+      title: "一部の素材を読み込めませんでした",
+      note,
+      done: job.done,
+      total: job.total,
+      failed: job.failed,
+      active: [],
+      busy: false,
+    });
+  };
   const toggleLiquid = () => {
     const next = !liquidModeRef.current;
-    liquidModeRef.current = next;
-    if (!next) liquidRef.current?.stop();
-    setLiquidMode(next);
+    if (!next) {
+      liquidArm.current += 1;
+      liquidBooting.current = false;
+      liquidModeRef.current = false;
+      liquidRef.current?.stop();
+      if (liquidRangeModeRef.current) endLiquidRange();
+      setLiquidMode(false);
+      setMediaGate(null);
+      return;
+    }
+    const token = ++liquidArm.current;
+    primePlayback();
+    const enable = () => {
+      liquidBooting.current = false;
+      if (liquidArm.current !== token || !itemRef.current) return;
+      liquidModeRef.current = true;
+      setLiquidMode(true);
+    };
+    if (kitReady("liquid")) {
+      enable();
+      return;
+    }
+    const run = () => {
+      if (liquidArm.current !== token) return;
+      const snap = kitSnapshot("liquid");
+      paintGate("液体の音と画像を読み込んでいます", "", snap, true);
+      gateCancelRef.current = () => {
+        liquidArm.current += 1;
+        liquidBooting.current = false;
+        setMediaGate(null);
+      };
+      gateRetryRef.current = null;
+      gateProceedRef.current = null;
+      window.requestAnimationFrame(() => {
+        if (liquidArm.current !== token) return;
+        void loadKit("liquid", (job) => {
+          if (liquidArm.current !== token) return;
+          paintGate("液体の音と画像を読み込んでいます", "", job, true);
+        }).then((job) => {
+          finishGate(liquidArm, token, "", enable, run, job);
+        }).catch(() => {
+          if (liquidArm.current !== token) return;
+          const job = kitSnapshot("liquid");
+          finishGate(liquidArm, token, "", enable, run, { ...job, ready: false, failed: job.failed.length > 0 ? job.failed : ["読み込みが中断されました"] });
+        });
+      });
+    };
+    run();
+  };
+  const openLiquidRange = () => {
+    if (phoneRef.current) return;
+    if (!liquidRangeModeRef.current) pauseForLiquidRange();
+    flatTilt();
+    liquidRef.current?.stop();
+    rangeDragRef.current = null;
+    setRangeDraft(null);
+    setHideDraft(null);
+    setRangeGesture(null);
+    if (liquidPickRef.current == null) {
+      const lastRange = liquidRangesRef.current[liquidRangesRef.current.length - 1];
+      const lastHide = liquidHidesRef.current[liquidHidesRef.current.length - 1];
+      const pick =
+        lastRange?.id != null ? { kind: "range" as const, id: lastRange.id } : lastHide?.id != null ? { kind: "hide" as const, id: lastHide.id } : null;
+      if (pick) {
+        liquidPickRef.current = pick;
+        setLiquidPick(pick);
+      }
+    }
+    liquidRangeModeRef.current = true;
+    setLiquidRangeMode(true);
+  };
+  const endLiquidRange = () => {
+    const was = liquidRangeModeRef.current;
+    rangeDragRef.current = null;
+    liquidRangeModeRef.current = false;
+    setLiquidRangeMode(false);
+    setRangeDraft(null);
+    setHideDraft(null);
+    setRangeGesture(null);
+    if (was) resumeLiquidRange();
+  };
+  const selectLiquid = (pick: { kind: "range" | "hide"; id: number }) => {
+    rangeDragRef.current = null;
+    setRangeDraft(null);
+    setHideDraft(null);
+    setRangeGesture(null);
+    liquidPickRef.current = pick;
+    setLiquidPick(pick);
+  };
+  const deleteLiquidRange = () => {
+    rangeDragRef.current = null;
+    const pick = liquidPickRef.current;
+    if (!pick) return;
+    const ranges = liquidRangesRef.current;
+    const hides = liquidHidesRef.current;
+    if (pick.kind === "hide") {
+      const index = hides.findIndex((hide) => hide.id === pick.id);
+      if (index < 0) return;
+      const list = hides.filter((hide) => hide.id !== pick.id);
+      const next = list[Math.min(index, list.length - 1)];
+      const fallback = ranges[ranges.length - 1];
+      const nextPick = next?.id != null ? { kind: "hide" as const, id: next.id } : fallback?.id != null ? { kind: "range" as const, id: fallback.id } : null;
+      liquidHidesRef.current = list;
+      liquidPickRef.current = nextPick;
+      setLiquidHides(list);
+      setLiquidPick(nextPick);
+    } else {
+      const index = ranges.findIndex((range) => range.id === pick.id);
+      if (index < 0) return;
+      const list = ranges.filter((range) => range.id !== pick.id);
+      const next = list[Math.min(index, list.length - 1)];
+      const fallback = hides[hides.length - 1];
+      const nextPick = next?.id != null ? { kind: "range" as const, id: next.id } : fallback?.id != null ? { kind: "hide" as const, id: fallback.id } : null;
+      liquidRangesRef.current = list;
+      liquidPickRef.current = nextPick;
+      setLiquidRanges(list);
+      setLiquidPick(nextPick);
+    }
+    setRangeDraft(null);
+    setHideDraft(null);
+    setRangeGesture(null);
+  };
+  const deleteLaunchRange = (id: number) => {
+    rangeDragRef.current = null;
+    const ranges = liquidRangesRef.current;
+    const index = ranges.findIndex((range) => range.id === id);
+    if (index < 0) return;
+    const list = ranges.filter((range) => range.id !== id);
+    liquidRangesRef.current = list;
+    setLiquidRanges(list);
+    const pick = liquidPickRef.current;
+    if (pick?.kind === "range" && pick.id === id) {
+      const next = list[Math.min(index, list.length - 1)];
+      const fallback = liquidHidesRef.current[liquidHidesRef.current.length - 1];
+      const nextPick = next?.id != null ? { kind: "range" as const, id: next.id } : fallback?.id != null ? { kind: "hide" as const, id: fallback.id } : null;
+      liquidPickRef.current = nextPick;
+      setLiquidPick(nextPick);
+    }
+    setRangeDraft(null);
+    setHideDraft(null);
+    setRangeGesture(null);
+  };
+  const rangeUnit = (event: ReactPointerEvent<HTMLElement>) => {
+    const rect = rangePlaneRef.current?.getBoundingClientRect();
+    if (!rect || !(rect.width > 0) || !(rect.height > 0)) return { u: 0, v: 0 };
+    return {
+      u: (event.clientX - rect.left) / rect.width,
+      v: (event.clientY - rect.top) / rect.height,
+    };
+  };
+  const rangeBox = (u0: number, v0: number, u1: number, v1: number): LiquidRange => ({
+    x: Math.min(u0, u1),
+    y: Math.min(v0, v1),
+    w: Math.abs(u1 - u0),
+    h: Math.abs(v1 - v0),
+    angle: 0,
+  });
+  const commitRange = (next: LiquidRange | null, kind: "new" | "edit") => {
+    setRangeDraft(null);
+    setHideDraft(null);
+    setRangeGesture(null);
+    if (!next) return;
+    if (kind === "new") {
+      const kept = normalizeLiquidRange(next);
+      if (!kept) return;
+      const id = nextLiquidRangeId(liquidRangesRef.current);
+      const box: LiquidRange = { ...kept, id };
+      const list = [...liquidRangesRef.current, box];
+      liquidRangesRef.current = list;
+      liquidPickRef.current = { kind: "range", id };
+      setLiquidRanges(list);
+      setLiquidPick(liquidPickRef.current);
+      return;
+    }
+    const id = next.id ?? (liquidPickRef.current?.kind === "range" ? liquidPickRef.current.id : null);
+    if (id == null) return;
+    const kept = normalizeLiquidRange({ ...next, id });
+    if (!kept) return;
+    const box: LiquidRange = { ...kept, id };
+    const list = liquidRangesRef.current.map((range) => (range.id === id ? box : range));
+    liquidRangesRef.current = list;
+    setLiquidRanges(list);
+  };
+  const commitHide = (next: LiquidHide | null, kind: "new" | "edit") => {
+    setRangeDraft(null);
+    setHideDraft(null);
+    setRangeGesture(null);
+    if (!next) return;
+    if (kind === "new") {
+      const kept = normalizeLiquidHide(next);
+      if (!kept) return;
+      const id = nextLiquidRangeId(liquidHidesRef.current);
+      const box: LiquidHide = { ...kept, id, shape: next.shape };
+      const list = [...liquidHidesRef.current, box];
+      liquidHidesRef.current = list;
+      liquidPickRef.current = { kind: "hide", id };
+      setLiquidHides(list);
+      setLiquidPick(liquidPickRef.current);
+      return;
+    }
+    const id = next.id ?? (liquidPickRef.current?.kind === "hide" ? liquidPickRef.current.id : null);
+    if (id == null) return;
+    const kept = normalizeLiquidHide({ ...next, id });
+    if (!kept) return;
+    const box: LiquidHide = { ...kept, id, shape: next.shape };
+    const list = liquidHidesRef.current.map((hide) => (hide.id === id ? box : hide));
+    liquidHidesRef.current = list;
+    setLiquidHides(list);
+  };
+  const rangeLiveRef = useRef<LiquidRange | null>(null);
+  const hideLiveRef = useRef<LiquidHide | null>(null);
+  const onRangeDown = (event: ReactPointerEvent<HTMLElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    rangeLiveRef.current = null;
+    hideLiveRef.current = null;
+    const point = rangeUnit(event);
+    const rect = rangePlaneRef.current?.getBoundingClientRect();
+    const ranges = liquidRangesRef.current;
+    const hides = liquidHidesRef.current;
+    const padU = rect && rect.width > 0 ? 28 / rect.width : 0.04;
+    const padV = rect && rect.height > 0 ? 28 / rect.height : 0.04;
+    const insetU = rect && rect.width > 0 ? 26 / rect.width : 0.03;
+    const insetV = rect && rect.height > 0 ? 26 / rect.height : 0.03;
+    const aspect = frame && frame.height > 0 ? frame.width / frame.height : 1;
+    const shapes = [
+      ...ranges.map((range) => ({ target: "range" as const, shape: "rect" as const, box: range })),
+      ...hides.map((hide) => ({ target: "hide" as const, shape: hide.shape, box: hide })),
+    ];
+    const pick = liquidPickRef.current;
+    const selected = shapes.find((shape) => pick != null && shape.target === pick.kind && shape.box.id === pick.id) ?? null;
+    const dragFor = (shape: (typeof shapes)[number], hit: ReturnType<typeof liquidRangeHit>) => {
+      if (shape.target === "range" && hit.kind === "corner") {
+        return { id: event.pointerId, kind: "corner" as const, corner: hit.corner, box: shape.box, aspect, target: "range" as const, shape: shape.shape };
+      }
+      if (shape.target === "range" && hit.kind === "edge") {
+        return { id: event.pointerId, kind: "face" as const, edge: hit.edge, u: point.u, v: point.v, box: shape.box, aspect, target: "range" as const, shape: shape.shape };
+      }
+      if (shape.target === "range" && hit.kind === "lean") {
+        const pivot = liquidRangePivot(shape.box, aspect);
+        return {
+          id: event.pointerId,
+          kind: "spin" as const,
+          offset: liquidRangeHeading(point.u, point.v, pivot.x, pivot.y, aspect),
+          box: shape.box,
+          aspect,
+          target: "range" as const,
+          shape: shape.shape,
+        };
+      }
+      if (hit.kind === "corner") {
+        return { id: event.pointerId, kind: "resize" as const, corner: hit.corner, box: shape.box, aspect, target: shape.target, shape: shape.shape };
+      }
+      if (hit.kind === "edge") {
+        const cx = shape.box.x + shape.box.w / 2;
+        const cy = shape.box.y + shape.box.h / 2;
+        return {
+          id: event.pointerId,
+          kind: "turn" as const,
+          offset: liquidRangeHeading(point.u, point.v, cx, cy, aspect) - (shape.box.angle ?? 0),
+          box: shape.box,
+          aspect,
+          target: shape.target,
+          shape: shape.shape,
+        };
+      }
+      if (hit.kind === "lean") {
+        return { id: event.pointerId, kind: "lean" as const, edge: hit.edge, u: point.u, v: point.v, box: shape.box, aspect, target: shape.target, shape: shape.shape };
+      }
+      if (hit.kind === "move" || hit.kind === "inside") {
+        return { id: event.pointerId, kind: "move" as const, u: point.u, v: point.v, box: shape.box, target: shape.target, shape: shape.shape };
+      }
+      return null;
+    };
+    const take = (shape: (typeof shapes)[number], hit: ReturnType<typeof liquidRangeHit>) => {
+      const drag = dragFor(shape, hit);
+      if (!drag || shape.box.id == null) return false;
+      const next = { kind: shape.target, id: shape.box.id };
+      if (!pick || pick.kind !== next.kind || pick.id !== next.id) {
+        liquidPickRef.current = next;
+        setLiquidPick(next);
+      }
+      rangeDragRef.current = drag;
+      setRangeGesture("edit");
+      return true;
+    };
+    const capture = () => {
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId);
+      } catch {
+        /* the drag still follows the finger on the picture */
+      }
+    };
+    if (selected) {
+      const hit = liquidShapeHit(selected.box, selected.shape, point.u, point.v, padU, padV, aspect, insetU, insetV);
+      if (hit.kind === "move" || hit.kind === "corner" || hit.kind === "edge" || hit.kind === "lean") {
+        if (take(selected, hit)) capture();
+        return;
+      }
+    }
+    for (let i = shapes.length - 1; i >= 0; i--) {
+      const shape = shapes[i];
+      if (!shape) continue;
+      const hit = liquidShapeHit(shape.box, shape.shape, point.u, point.v, padU, padV, aspect, insetU, insetV);
+      if (hit.kind !== "inside" && hit.kind !== "move") continue;
+      if (take(shape, hit)) {
+        capture();
+        return;
+      }
+    }
+    rangeDragRef.current = { id: event.pointerId, kind: "new", tool: rangeTool, u: point.u, v: point.v };
+    setRangeGesture("new");
+    setRangeDraft(null);
+    setHideDraft(null);
+    capture();
+  };
+  const draftFromDrag = (drag: NonNullable<(typeof rangeDragRef)["current"]>, point: { u: number; v: number }) => {
+    const aspect = frame && frame.height > 0 ? frame.width / frame.height : 1;
+    if (drag.kind === "new") {
+      if (drag.tool === "circle") return { kind: "hide" as const, hide: liquidHideCircle(drag.u, drag.v, point.u, point.v, aspect) };
+      if (drag.tool === "rect") return { kind: "hide" as const, hide: { ...rangeBox(drag.u, drag.v, point.u, point.v), shape: "rect" as const } };
+      return { kind: "range" as const, range: rangeBox(drag.u, drag.v, point.u, point.v) };
+    }
+    const resized =
+      drag.kind === "resize"
+        ? drag.shape === "circle"
+          ? liquidHideResize({ ...drag.box, shape: "circle" }, drag.corner, point.u, point.v, drag.aspect)
+          : liquidRangeResize(drag.box, drag.corner, point.u, point.v, drag.aspect)
+        : null;
+    const moved = drag.kind === "move" ? liquidRangeMove(drag.box, point.u - drag.u, point.v - drag.v) : null;
+    const leaned = drag.kind === "lean" ? liquidRangeLeanDrag(drag.box, drag.edge, point.u - drag.u, point.v - drag.v, drag.aspect) : null;
+    const cornered = drag.kind === "corner" ? liquidRangeCorner(drag.box, drag.corner, point.u, point.v, drag.aspect) : null;
+    const faced = drag.kind === "face" ? liquidRangeEdge(drag.box, drag.edge, point.u, point.v, drag.u, drag.v, drag.aspect) : null;
+    let turned: LiquidRange | null = null;
+    if (drag.kind === "turn") {
+      const cx = drag.box.x + drag.box.w / 2;
+      const cy = drag.box.y + drag.box.h / 2;
+      turned = liquidRangeTurn(drag.box, liquidRangeHeading(point.u, point.v, cx, cy, drag.aspect) - drag.offset);
+      if (!turned) return null;
+    }
+    let spun: LiquidRange | null = null;
+    if (drag.kind === "spin") {
+      const pivot = liquidRangePivot(drag.box, drag.aspect);
+      spun = liquidRangeSpin(drag.box, liquidRangeHeading(point.u, point.v, pivot.x, pivot.y, drag.aspect) - drag.offset, drag.aspect);
+      if (!spun) return null;
+    }
+    const next = resized ?? moved ?? leaned ?? turned ?? cornered ?? faced ?? spun;
+    if (!next) return null;
+    if (drag.target === "hide") return { kind: "hide" as const, hide: { ...next, id: drag.box.id, shape: drag.shape } };
+    return { kind: "range" as const, range: { ...next, id: drag.box.id } };
+  };
+  const showDraft = (raw: { kind: "range"; range: LiquidRange } | { kind: "hide"; hide: LiquidHide } | null) => {
+    if (!raw) return;
+    if (raw.kind === "hide") {
+      hideLiveRef.current = raw.hide;
+      rangeLiveRef.current = null;
+      setHideDraft(raw.hide);
+      setRangeDraft(null);
+      return;
+    }
+    rangeLiveRef.current = raw.range;
+    hideLiveRef.current = null;
+    setRangeDraft(raw.range);
+    setHideDraft(null);
+  };
+  const onRangeMove = (event: ReactPointerEvent<HTMLElement>) => {
+    const drag = rangeDragRef.current;
+    if (!drag || drag.id !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    showDraft(draftFromDrag(drag, rangeUnit(event)));
+  };
+  const onRangeUp = (event: ReactPointerEvent<HTMLElement>) => {
+    const drag = rangeDragRef.current;
+    if (!drag || drag.id !== event.pointerId) return;
+    event.stopPropagation();
+    rangeDragRef.current = null;
+    const raw = draftFromDrag(drag, rangeUnit(event));
+    if (drag.kind === "new") {
+      if (drag.tool === "range") commitRange(raw?.kind === "range" ? raw.range : rangeLiveRef.current, "new");
+      else commitHide(raw?.kind === "hide" ? raw.hide : hideLiveRef.current, "new");
+    } else if (drag.target === "hide") {
+      commitHide(raw?.kind === "hide" ? raw.hide : hideLiveRef.current, "edit");
+    } else {
+      commitRange(raw?.kind === "range" ? raw.range : rangeLiveRef.current, "edit");
+    }
+    rangeLiveRef.current = null;
+    hideLiveRef.current = null;
+  };
+  const openHiddenTools = () => {
+    if (pcToolsRef.current) return;
+    const token = ++hiddenArm.current;
+    primePlayback();
+    const enable = () => {
+      if (hiddenArm.current !== token || !itemRef.current) return;
+      setPcTools(true);
+    };
+    if (kitReady("liquid")) {
+      enable();
+      return;
+    }
+    const run = () => {
+      if (hiddenArm.current !== token) return;
+      const snap = kitSnapshot("liquid");
+      paintGate("液体の音と画像を読み込んでいます", "", snap, true);
+      gateCancelRef.current = () => {
+        hiddenArm.current += 1;
+        setMediaGate(null);
+      };
+      gateRetryRef.current = null;
+      gateProceedRef.current = null;
+      window.requestAnimationFrame(() => {
+        if (hiddenArm.current !== token) return;
+        void loadKit("liquid", (job) => {
+          if (hiddenArm.current !== token) return;
+          paintGate("液体の音と画像を読み込んでいます", "", job, true);
+        }).then((job) => {
+          finishGate(hiddenArm, token, "", enable, run, job);
+        }).catch(() => {
+          if (hiddenArm.current !== token) return;
+          const job = kitSnapshot("liquid");
+          finishGate(hiddenArm, token, "", enable, run, { ...job, ready: false, failed: job.failed.length > 0 ? job.failed : ["読み込みが中断されました"] });
+        });
+      });
+    };
+    run();
+  };
+  const openPhoneAnim = () => {
+    setAnimMenu(false);
+    setVoiceMenu(false);
+    setVoiceRateOpen(false);
+    setSensorMenu(false);
+    setShakeMenu(false);
+    primePlayback();
+    setPhonePlay(true);
   };
   const placeKnob = (x: number, y: number) => {
     const node = stickKnobRef.current;
@@ -3314,6 +5271,245 @@ export function Lightbox({
       ■
     </Button>
   );
+  recallPlayRef.current = recallPlay;
+  stopTogetherRef.current = stopTogether;
+  toggleLiquidRef.current = toggleLiquid;
+  useEffect(() => {
+    if (phone || !pcTools || !itemId) {
+      hiddenKeys.current.clear();
+      return;
+    }
+    const typingTarget = (event: KeyboardEvent) => {
+      const target = event.target;
+      return target instanceof HTMLElement && !!target.closest("input, textarea, select, [contenteditable='true']");
+    };
+    const onDown = (event: KeyboardEvent) => {
+      if (frameListRef.current) return;
+      const upDown = event.key === "ArrowUp" || event.key === "ArrowDown";
+      const editing = puruEditRef.current || vectorEditRef.current || effectEditRef.current || editingRef.current;
+      const active = !phoneRef.current && pcToolsRef.current && !typingTarget(event) && !editing;
+      if (!upDown || !active) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.repeat || hiddenKeys.current.has(event.key)) return;
+      hiddenKeys.current.add(event.key);
+      const play = normalizeImagePlay(itemRef.current?.play);
+      const audio = audioRef.current;
+      const favoriteLive = favoritePlaybackLive({
+        hasFavorite: play !== null,
+        savedAnim: !!play && (play.kind !== null || play.zoom || play.twist),
+        animRunning: !animHoldRef.current && (animKindRef.current !== null || animZoomRef.current || animTwistRef.current),
+        savedVoice: !!play?.voiceId,
+        voiceRunning: !!play?.voiceId && voiceIdRef.current === play.voiceId && !!audio && !audio.paused,
+        savedVector: !!play?.vector,
+        vectorRunning: !!play?.vector && vectorPlayRef.current,
+        savedEffect: !!play?.effect,
+        effectRunning: !!play?.effect && effectPlayRef.current,
+      });
+      const current = itemRef.current;
+      const command = hiddenArrowCommand({
+        key: event.key,
+        repeat: false,
+        held: false,
+        phone: false,
+        hidden: true,
+        typing: false,
+        editing: false,
+        favoriteLive,
+        hasFavorite: play !== null,
+        canLiquid: acceptsLiquidImage(current),
+        liquidMode: liquidModeRef.current,
+        liquidBooting: liquidBooting.current,
+      });
+      if (dotStudioRef.current) return;
+      if (command === "favorite-stop") stopTogetherRef.current();
+      else if (command === "favorite-play") recallPlayRef.current();
+      else if (command === "liquid-arm") {
+        toggleLiquidRef.current();
+        if (!liquidModeRef.current) liquidBooting.current = true;
+      } else if (command === "liquid-fire") {
+        if (liquidRangeModeRef.current) return;
+        liquidRef.current?.aim(0.5, 0.5, true);
+        liquidRef.current?.stop();
+      }
+    };
+    const onUp = (event: KeyboardEvent) => {
+      hiddenKeys.current.delete(event.key);
+    };
+    const onBlur = () => {
+      hiddenKeys.current.clear();
+    };
+    window.addEventListener("keydown", onDown, true);
+    window.addEventListener("keyup", onUp, true);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      hiddenKeys.current.clear();
+      window.removeEventListener("keydown", onDown, true);
+      window.removeEventListener("keyup", onUp, true);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [phone, pcTools, itemId]);
+  useEffect(() => {
+    const current = itemRef.current;
+    const auto = autoFavoriteMode(phone, pcTools) && current !== null;
+    if (!auto) {
+      if (autoArmed.current) {
+        autoArmed.current = false;
+        silencePlayback();
+      }
+      return () => {
+        voiceGen.current += 1;
+      };
+    }
+    autoArmed.current = true;
+    const play = normalizeImagePlay(current.play);
+    if (!play) silencePlayback();
+    else startSavedPlay(play, true);
+    return () => {
+      voiceGen.current += 1;
+    };
+  }, [itemId, phone, pcTools]);
+  const copyCurrentDisplay = () => {
+    const current = itemRef.current;
+    if (!current || phoneRef.current || !current.mime.startsWith("image/")) return;
+    if (copyLock.current) {
+      notify("表示状態の複製を作成しています。");
+      return;
+    }
+    const sourceId = current.id;
+    let live: DisplayCopyLive;
+    try {
+      live = {
+        puru: structuredClone(puruMarkersRef.current),
+        vectors: structuredClone(vectorMarkersRef.current),
+        effects: structuredClone(effectMarkersRef.current),
+        liquid: structuredClone(liquidRangesRef.current),
+        liquidHide: structuredClone(liquidHidesRef.current),
+      };
+    } catch {
+      notify("表示状態を読み取れなかったため、複製を作っていません。");
+      return;
+    }
+    copyLock.current = true;
+    setCopying(true);
+    void copyDisplayState(sourceId, live, () => settledInk(sourceId))
+      .then((next) => {
+        if (next) onCopied?.(next);
+      })
+      .finally(() => {
+        copyLock.current = false;
+        setCopying(false);
+      });
+  };
+  const copyDotStill = () => {
+    const current = itemRef.current;
+    const source = mediaRef.current;
+    if (!current || !source || phoneRef.current) return;
+    if (dotCopyLock.current) {
+      notify("ドットの複製を作成しています。");
+      return;
+    }
+    dotCopyLock.current = true;
+    setDotCopying(true);
+    const cols = dotMosaic ? dotCols : null;
+    const colors = dotColorOn ? dotColors : null;
+    const recipe = dotRecipeLive;
+    void rasterDotStill(source, cols, colors, recipe)
+      .then((png) => {
+        if (!png) {
+          notify("表示中の画像を読めなかったので、複製は作っていません。");
+          return null;
+        }
+        return addDotStill(current.id, png);
+      })
+      .catch(() => {
+        notify("ドット絵を画像にできなかったので、複製は作っていません。");
+        return null;
+      })
+      .finally(() => {
+        dotCopyLock.current = false;
+        setDotCopying(false);
+      });
+  };
+  const toggleDotMenu = () => {
+    if (phoneRef.current) return;
+    setDotMenu(false);
+    setDotAnchor(0);
+    setDotRange(null);
+    setDotStudio(true);
+  };
+  useEffect(() => {
+    if (!dotStudio) return;
+    const clock = animClock.current;
+    const heldBefore = studioHoldRef.current;
+    studioHoldRef.current = true;
+    if (clock.frozen === null) clock.frozen = performance.now();
+    const audio = audioRef.current;
+    const audioWasPlaying = Boolean(audio && !audio.paused);
+    if (audioWasPlaying) audio?.pause();
+    const node = mediaRef.current;
+    const video = node instanceof HTMLVideoElement ? node : null;
+    const videoWasPlaying = Boolean(video && !video.paused);
+    if (videoWasPlaying) video?.pause();
+    stopLiquidSounds();
+    syncGoldSound("pause");
+    rubberGen.current += 1;
+    if (rubberFrame.current) {
+      window.cancelAnimationFrame(rubberFrame.current);
+      rubberFrame.current = 0;
+    }
+    if (hoverFrame.current) {
+      window.cancelAnimationFrame(hoverFrame.current);
+      hoverFrame.current = 0;
+    }
+    const halt = (event: Event) => {
+      const media = event.currentTarget;
+      if (media instanceof HTMLMediaElement && dotStudioRef.current) media.pause();
+    };
+    const audioNode = audioRef.current;
+    video?.addEventListener("play", halt);
+    audioNode?.addEventListener("play", halt);
+    const paintStill = () => {
+      const canvas = studioStillRef.current;
+      const source = mediaRef.current;
+      if (!canvas || !(source instanceof HTMLImageElement)) return;
+      const width = source.naturalWidth;
+      const height = source.naturalHeight;
+      if (width < 1 || height < 1) return;
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      const ctx = canvas.getContext("2d", { alpha: true });
+      if (!ctx) return;
+      ctx.clearRect(0, 0, width, height);
+      ctx.drawImage(source, 0, 0, width, height);
+    };
+    paintStill();
+    const image = node instanceof HTMLImageElement ? node : null;
+    image?.addEventListener("load", paintStill);
+    return () => {
+      image?.removeEventListener("load", paintStill);
+      video?.removeEventListener("play", halt);
+      audioNode?.removeEventListener("play", halt);
+      if (!itemRef.current) return;
+      studioHoldRef.current = heldBefore;
+      if (!heldBefore && clock.frozen !== null) {
+        clock.origin += performance.now() - clock.frozen;
+        clock.frozen = null;
+      }
+      if (audioWasPlaying) void audio?.play().catch(() => undefined);
+      if (videoWasPlaying) void video?.play().catch(() => undefined);
+      syncGoldSound(
+        goldSoundMode({
+          playing: effectPlayRef.current,
+          preview: effectPreviewRef.current,
+          held: markerHoldRef.current?.effect === true,
+          goldVisible: effectMarkersRef.current.some((marker) => marker.kind === "gold" && marker.off !== true),
+        }),
+      );
+    };
+  }, [dotStudio]);
   if (contained && !container) return null;
 
   return (
@@ -3321,7 +5517,7 @@ export function Lightbox({
       open={item !== null}
       modal={!contained}
       onOpenChange={(open) => {
-        if (!open && (puruEditRef.current || vectorEditRef.current)) return;
+        if (!open && (puruEditRef.current || vectorEditRef.current || effectEditRef.current)) return;
         if (!open) onClose();
       }}
     >
@@ -3354,7 +5550,7 @@ export function Lightbox({
         )}
         <Dialog.Content
           ref={contentRef}
-          className={[phone ? "lightbox-content is-phone" : "lightbox-content", editing ? "is-inking" : "", contained ? "is-docked" : "", puruEdit ? "is-puru-open" : ""].filter(Boolean).join(" ")}
+          className={[phone ? "lightbox-content is-phone" : "lightbox-content", editing ? "is-inking" : "", contained ? "is-docked" : "", puruEdit ? "is-puru-open" : "", dotStudio ? "is-dot-still" : ""].filter(Boolean).join(" ")}
           onCloseAutoFocus={(event) => {
             event.preventDefault();
           }}
@@ -3381,9 +5577,15 @@ export function Lightbox({
             if (viewerPhone()) cancelPhone(event);
           }}
           onKeyDown={(event) => {
-            if (puruEditRef.current || vectorEditRef.current) return;
+            if (puruEditRef.current || vectorEditRef.current || effectEditRef.current || liquidRangeModeRef.current) return;
             if (event.key === "ArrowRight") step(1);
             if (event.key === "ArrowLeft") step(-1);
+          }}
+          onEscapeKeyDown={(event) => {
+            const back = frameBackRef.current;
+            if (!back) return;
+            event.preventDefault();
+            back();
           }}
         >
           {item ? (
@@ -3396,8 +5598,10 @@ export function Lightbox({
                 onEnded={() => {
                   const audio = audioRef.current;
                   if (!audio || !voiceIdRef.current || audio.loop) return;
+                  const gen = voiceGen.current;
                   audio.currentTime = 0;
                   void audio.play().catch(() => {
+                    if (voiceGen.current !== gen) return;
                     setVoiceError("再生できませんでした。もう一度選んでください");
                   });
                 }}
@@ -3446,6 +5650,51 @@ export function Lightbox({
                       </label>
                     </div>
                   ) : null}
+                  {item.mime.startsWith("image/") ? (
+                    item.animated && item.mime === "image/gif" ? (
+                      <Button
+                        variant="quiet"
+                        className="display-copy"
+                        onPointerDown={(event) => event.stopPropagation()}
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          setFrameFor(item.id);
+                        }}
+                      >
+                        フレームを一覧化する
+                      </Button>
+                    ) : (
+                    <Button
+                      variant="quiet"
+                      className="display-copy"
+                      disabled={copying}
+                      onPointerDown={(event) => event.stopPropagation()}
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        copyCurrentDisplay();
+                      }}
+                    >
+                      表示状態の複製をつくる
+                    </Button>
+                    )
+                  ) : null}
+                  {onPlate ? (
+                    <div className="seg lightbox-plate-seg" role="group" aria-label="透過背景" onPointerDown={(event) => event.stopPropagation()}>
+                      {(
+                        [
+                          ["clear", "透明"],
+                          ["white", "白"],
+                          ["green", "緑"],
+                        ] as const
+                      ).map(([id, label]) => (
+                        <button key={id} type="button" className={plate === id ? "is-on" : undefined} aria-pressed={plate === id} onClick={() => onPlate(id)}>
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
                   <Dialog.Close asChild>
                     <Button variant="quiet">閉じる</Button>
                   </Dialog.Close>
@@ -3453,7 +5702,7 @@ export function Lightbox({
               )}
               <div
                 ref={bindStage}
-                className="lightbox-stage"
+                className={effectEdit ? "lightbox-stage is-effect-edit" : "lightbox-stage"}
                 onPointerDown={(event) => {
                   if (editing) return;
                   suppressClick.current = false;
@@ -3488,14 +5737,14 @@ export function Lightbox({
                     event.preventDefault();
                     return;
                   }
-                  if (puruEditRef.current || vectorEditRef.current) return;
+                  if (puruEditRef.current || vectorEditRef.current || effectEditRef.current) return;
                   if (event.target === event.currentTarget) onClose();
                 }}
               >
                 {!phone && markerMode ? (
                   <aside
                     className="marker-list"
-                    aria-label={puruEdit ? "ぷるぷるマーカー一覧" : "ベクトルマーカー一覧"}
+                    aria-label={puruEdit ? "ぷるぷるマーカー一覧" : effectEdit ? "エフェクトマーカー一覧" : "ベクトルマーカー一覧"}
                     onPointerDown={(event) => event.stopPropagation()}
                     onPointerMove={(event) => event.stopPropagation()}
                     onPointerUp={(event) => event.stopPropagation()}
@@ -3503,37 +5752,104 @@ export function Lightbox({
                     onClick={(event) => event.stopPropagation()}
                     onWheel={(event) => event.stopPropagation()}
                   >
-                    <p className="marker-list-title">{puruEdit ? "ぷるぷる" : "ベクトル"}</p>
-                    {(puruEdit ? puruListEntries(puruMarkers) : vectorListEntries(vectorMarkers)).length === 0 ? (
+                    <p className="marker-list-title">{puruEdit ? "ぷるぷる" : effectEdit ? "エフェクト" : "ベクトル"}</p>
+                    {(puruEdit ? puruListEntries(puruMarkers) : effectEdit ? effectListEntries(effectMarkers) : vectorListEntries(vectorMarkers)).length === 0 ? (
                       <p className="marker-list-empty">まだありません</p>
                     ) : (
                       <ol>
-                        {(puruEdit ? puruListEntries(puruMarkers) : vectorListEntries(vectorMarkers)).map((entry, index) => {
-                          const selected = puruEdit ? entry.id === puruSelected : entry.id === vectorSelected;
+                        {(puruEdit ? puruListEntries(puruMarkers) : effectEdit ? effectListEntries(effectMarkers) : vectorListEntries(vectorMarkers)).map((entry, index) => {
+                          const selected = puruEdit ? entry.id === puruSelected : effectEdit ? entry.id === effectSelected : entry.id === vectorSelected;
                           return (
                             <li key={`${entry.group}-${entry.id}`}>
-                              <button
-                                type="button"
-                                className={selected ? "is-on" : ""}
-                                aria-pressed={selected}
-                                aria-label={`${index + 1} ${entry.group} ${entry.name}${entry.pace ? ` ${entry.pace}` : ""}`}
-                                onClick={(event) => {
-                                  event.preventDefault();
-                                  event.stopPropagation();
-                                  if (puruEdit) {
-                                    setPuruSelected(entry.id);
-                                    return;
-                                  }
-                                  setVectorSelected(entry.id);
-                                  const marker = vectorMarkersRef.current.find((stored) => stored.id === entry.id);
-                                  if (marker) setVectorArmed({ kind: marker.kind, pace: marker.pace });
-                                }}
-                              >
-                                <span className="marker-list-index">{index + 1}</span>
-                                <span className="marker-list-group">{entry.group}</span>
-                                <span className="marker-list-name">{entry.name}</span>
-                                {entry.pace ? <span className="marker-list-pace">{entry.pace}</span> : null}
-                              </button>
+                              <div className={entry.off ? "marker-list-row is-off" : "marker-list-row"}>
+                                <button
+                                  type="button"
+                                  className={selected ? "marker-list-pick is-on" : "marker-list-pick"}
+                                  aria-pressed={selected}
+                                  aria-label={`${index + 1} ${entry.group} ${entry.name}${entry.pace ? ` ${entry.pace}` : ""}`}
+                                  onClick={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    if (puruEdit) {
+                                      setPuruSelected(entry.id);
+                                      return;
+                                    }
+                                    if (effectEdit) {
+                                      setEffectSelected(entry.id);
+                                      const marker = effectMarkersRef.current.find((stored) => stored.id === entry.id);
+                                      if (marker) {
+                                        effectPaceRef.current = marker.pace;
+                                        setEffectPace(marker.pace);
+                                        setEffectKind(marker.kind);
+                                      }
+                                      return;
+                                    }
+                                    setVectorSelected(entry.id);
+                                    const marker = vectorMarkersRef.current.find((stored) => stored.id === entry.id);
+                                    if (marker) setVectorArmed({ kind: marker.kind, pace: marker.pace });
+                                  }}
+                                >
+                                  <span className="marker-list-index">{index + 1}</span>
+                                  <span className="marker-list-name" style={entry.off ? undefined : { color: entry.color }}>
+                                    {entry.name}
+                                  </span>
+                                  {entry.pace ? <span className="marker-list-pace">{entry.pace}</span> : null}
+                                </button>
+                                {puruEdit ? null : (
+                                  <button
+                                    type="button"
+                                    className={entry.backbeat ? "marker-list-backbeat is-on" : "marker-list-backbeat"}
+                                    aria-pressed={entry.backbeat}
+                                    aria-label={entry.backbeat ? `${index + 1} ${entry.name}の裏拍を解除` : `${index + 1} ${entry.name}を裏拍にする`}
+                                    onPointerDown={(event) => {
+                                      event.stopPropagation();
+                                    }}
+                                    onClick={(event) => {
+                                      event.preventDefault();
+                                      event.stopPropagation();
+                                      if (effectEdit) toggleEffectBackbeat(entry.id);
+                                      else toggleVectorBackbeat(entry.id);
+                                    }}
+                                  >
+                                    裏
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  className="marker-list-mute"
+                                  aria-pressed={entry.off}
+                                  aria-label={entry.off ? `${index + 1} ${entry.name}を表示する` : `${index + 1} ${entry.name}を非表示にする`}
+                                  onPointerDown={(event) => {
+                                    event.stopPropagation();
+                                  }}
+                                  onClick={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    if (puruEdit) togglePuruMarker(entry.id);
+                                    else if (effectEdit) toggleEffectMarker(entry.id);
+                                    else toggleVectorMarker(entry.id);
+                                  }}
+                                >
+                                  🚫
+                                </button>
+                                <button
+                                  type="button"
+                                  className="marker-list-remove"
+                                  aria-label={`${index + 1} ${entry.name}を削除`}
+                                  onPointerDown={(event) => {
+                                    event.stopPropagation();
+                                  }}
+                                  onClick={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    if (puruEdit) removePuruMarker(entry.id);
+                                    else if (effectEdit) removeEffectMarker(entry.id);
+                                    else removeVectorMarker(entry.id);
+                                  }}
+                                >
+                                  ×
+                                </button>
+                              </div>
                             </li>
                           );
                         })}
@@ -3541,34 +5857,121 @@ export function Lightbox({
                     )}
                   </aside>
                 ) : null}
-                {incomingFrame && incomingUrl && incomingItem
+                {!phone && liquidRangeMode && !markerMode ? (
+                  <aside
+                    className="marker-list"
+                    aria-label="発射範囲一覧"
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onPointerMove={(event) => event.stopPropagation()}
+                    onPointerUp={(event) => event.stopPropagation()}
+                    onPointerCancel={(event) => event.stopPropagation()}
+                    onClick={(event) => event.stopPropagation()}
+                    onWheel={(event) => event.stopPropagation()}
+                  >
+                    <p className="marker-list-title">発射範囲</p>
+                    {liquidRanges.length === 0 ? (
+                      <p className="marker-list-empty">まだありません</p>
+                    ) : (
+                      <ol>
+                        {liquidRanges.map((range, index) => {
+                          const selected = liquidPick?.kind === "range" && range.id === liquidPick.id;
+                          return (
+                            <li key={range.id ?? index}>
+                              <div className="marker-list-row">
+                                <button
+                                  type="button"
+                                  className={selected ? "marker-list-pick is-on" : "marker-list-pick"}
+                                  aria-pressed={selected}
+                                  aria-label={`${index + 1} 範囲`}
+                                  onClick={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    if (range.id != null) selectLiquid({ kind: "range", id: range.id });
+                                  }}
+                                >
+                                  <span className="marker-list-index">{index + 1}</span>
+                                  <span className="marker-list-name">範囲</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  className="marker-list-remove"
+                                  aria-label={`${index + 1} 範囲を削除`}
+                                  onPointerDown={(event) => event.stopPropagation()}
+                                  onClick={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    if (range.id != null) deleteLaunchRange(range.id);
+                                  }}
+                                >
+                                  ×
+                                </button>
+                              </div>
+                            </li>
+                          );
+                        })}
+                      </ol>
+                    )}
+                    <p className="marker-list-title">非表示</p>
+                    {liquidHides.length === 0 ? (
+                      <p className="marker-list-empty">まだありません</p>
+                    ) : (
+                      <ol>
+                        {liquidHides.map((hide, index) => {
+                          const selected = liquidPick?.kind === "hide" && hide.id === liquidPick.id;
+                          const name = hide.shape === "circle" ? "円" : "四角";
+                          return (
+                            <li key={hide.id ?? index}>
+                              <div className="marker-list-row">
+                                <button
+                                  type="button"
+                                  className={selected ? "marker-list-pick is-on" : "marker-list-pick"}
+                                  aria-pressed={selected}
+                                  aria-label={`${index + 1} ${name}の非表示`}
+                                  onClick={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    if (hide.id != null) selectLiquid({ kind: "hide", id: hide.id });
+                                  }}
+                                >
+                                  <span className="marker-list-index">{index + 1}</span>
+                                  <span className="marker-list-name">{name}</span>
+                                </button>
+                              </div>
+                            </li>
+                          );
+                        })}
+                      </ol>
+                    )}
+                  </aside>
+                ) : null}
+                {incomingFrame && incomingUrl && incomingItem && incomingStyle
                   ? motionWrap(
-                      mediaStyle(incomingFrame, IDENTITY_ZOOM, true, false, { x: incomingShift, y: 0 }, dragAnim),
+                      incomingStyle,
                       true,
                       incomingItem.mime.startsWith("video/") ? (
-                        <video
-                          className="lightbox-incoming"
-                          src={incomingUrl}
-                          muted
-                          playsInline
-                          style={
-                            motionOn
-                              ? fitted
-                              : mediaStyle(incomingFrame, IDENTITY_ZOOM, true, false, { x: incomingShift, y: 0 }, dragAnim)
-                          }
-                        />
+                        <video className="lightbox-incoming" src={incomingUrl} muted playsInline style={incomingStyle} />
                       ) : (
-                        <img
-                          className="lightbox-incoming"
-                          src={incomingUrl}
-                          alt=""
-                          draggable={false}
-                          style={
-                            motionOn
-                              ? fitted
-                              : mediaStyle(incomingFrame, IDENTITY_ZOOM, true, false, { x: incomingShift, y: 0 }, dragAnim)
-                          }
-                        />
+                        <>
+                          {plate !== "clear" ? <div className={`gallery-plate is-${plate}`} style={incomingStyle} aria-hidden="true" /> : null}
+                          <img
+                            ref={incomingMediaRef}
+                            className={["lightbox-incoming", activeDot(incomingItem.dot).cols != null || activeDot(incomingItem.dot).colors != null ? "is-dot-hidden" : "", incomingPixel ? "is-pixel-view" : ""].filter(Boolean).join(" ")}
+                            src={incomingUrl}
+                            alt=""
+                            draggable={false}
+                            style={incomingStyle}
+                          />
+                          {activeDot(incomingItem.dot).cols != null || activeDot(incomingItem.dot).colors != null ? (
+                            <DotFilter
+                              sourceRef={incomingMediaRef}
+                              cols={activeDot(incomingItem.dot).cols}
+                              colors={activeDot(incomingItem.dot).colors}
+                              live={incomingItem.animated}
+                              sourceKey={`${incomingItem.id}:${activeDot(incomingItem.dot).cols ?? 0}:${activeDot(incomingItem.dot).colors ?? 0}`}
+                              style={incomingStyle}
+                            />
+                          ) : null}
+                        </>
                       ),
                     )
                   : null}
@@ -3595,14 +5998,26 @@ export function Lightbox({
                     tiltWrap(
                       mediaStyle(frame, shown, phone, zoomAnim && sameImage, phone ? shownDrag : DRAG_REST, dragAnim && sameImage, photoOpacity),
                       <>
+                        {plate !== "clear" ? <div className={`gallery-plate is-${plate}`} style={fitted} aria-hidden="true" /> : null}
+                        {dotStudio && !phone && dotPlate !== "clear" ? <div className={`dot-plate is-${dotPlate}`} style={fitted} aria-hidden="true" /> : null}
                         <img
                           ref={bindMedia}
                           src={url}
                           alt={item.name}
                           draggable={!phone && item.mime.startsWith("image/")}
-                          className={meshShown ? "puru-source" : clickCover ? "puru-click-source" : undefined}
+                          className={
+                            [
+                              meshShown && !studioFilterOn ? "puru-source" : clickCover ? "puru-click-source" : "",
+                              (dotActive && !meshShown && !dotStudio) || studioFilterOn ? "is-dot-hidden" : "",
+                              dotStudio && item.animated ? "is-studio-still" : "",
+                              pixelView ? "is-pixel-view" : "",
+                            ]
+                              .filter(Boolean)
+                              .join(" ") || undefined
+                          }
                           style={fitted}
                         />
+                        {dotStudio && !phone && item.animated ? <canvas ref={studioStillRef} className="dot-still-frame" style={fitted} aria-hidden="true" /> : null}
                         {meshOn ? (
                           <PuruMesh
                             sourceRef={mediaRef}
@@ -3613,15 +6028,45 @@ export function Lightbox({
                             viewRef={!phone && puruMarkers.length > 0 ? puruViewRef : undefined}
                             impulseRef={phone ? undefined : puruHitsRef}
                             vectorRef={vectorDriveRef}
+                            surfaceRef={meshSurfaceRef}
                             onImpulse={setPokeOn}
                             onReady={(ok) => {
                               setPuruDrawn(ok);
                               setMeshReady(ok);
                             }}
-                            style={{ ...fitted, opacity: puruLive || handMesh ? 1 : 0 }}
+                            still={dotStudio}
+                            style={{ ...fitted, opacity: studioFilterOn || (dotActive && meshShown) ? 0 : puruLive || handMesh ? 1 : 0 }}
                           />
                         ) : null}
-                        {!phone && frame && (vectorEdit || vectorShown) && !vectorPlay ? (
+                        {((dotActive && !dotStudio) || studioFilterOn) ? (
+                          <DotFilter
+                            sourceRef={studioFilterOn || !meshShown ? mediaRef : meshSurfaceRef}
+                            cols={dotStudio ? (dotMosaic ? dotCols : null) : dotPaintCols}
+                            colors={dotStudio ? (dotColorOn ? dotColors : null) : dotPaintColors}
+                            live={dotStudio ? false : meshShown || item.animated}
+                            sourceKey={`${item.id}:${studioFilterOn ? "studio" : meshShown ? "mesh" : "still"}:${dotPaintCols ?? 0}:${dotPaintColors ?? 0}:${dotFancyKey}`}
+                            recipe={dotRecipeLive}
+                            recipeKey={dotFancyKey}
+                            style={fitted}
+                          />
+                        ) : null}
+                        {dotStudio && !phone && dotPlace ? (
+                          <DotMarkerLayer
+                            markers={dotRecipeLive.markers}
+                            selectedId={dotPick}
+                            onSelect={setDotPick}
+                            onEdit={(id) => {
+                              if (!id) {
+                                setDotEdit(false);
+                                return;
+                              }
+                              setDotPick(id);
+                              setDotEdit(true);
+                            }}
+                            onChange={(markers) => void setImageDot(item.id, { markers })}
+                          />
+                        ) : null}
+                        {frame && !phone && (vectorEdit || vectorShown) && !vectorPlay ? (
                           <VectorField
                             markers={vectorMarkers}
                             selectedId={vectorSelected}
@@ -3634,16 +6079,144 @@ export function Lightbox({
                               if (marker) setVectorArmed({ kind: marker.kind, pace: marker.pace });
                             }}
                             onPatch={patchVector}
+                            onBackbeat={toggleVectorBackbeat}
+                          />
+                        ) : null}
+                        {(item?.id ?? null) === puruItemId && frame && !item.animated && (effectEdit || effectPlay) ? (
+                          <EffectField
+                            markers={effectMarkers}
+                            selectedId={effectSelected}
+                            editing={effectEdit}
+                            playing={effectEdit ? effectPreview : effectPlay}
+                            hold={dotStudio}
+                            origin={effectOrigin}
+                            width={frame.width}
+                            height={frame.height}
+                            onSelect={(id) => {
+                              setEffectSelected(id);
+                              if (id === null) return;
+                              const marker = effectMarkersRef.current.find((entry) => entry.id === id);
+                              if (!marker) return;
+                              effectPaceRef.current = marker.pace;
+                              setEffectPace(marker.pace);
+                              setEffectKind(marker.kind);
+                            }}
+                            onPatch={patchEffect}
+                            onBackbeat={toggleEffectBackbeat}
                           />
                         ) : null}
                         {liquidImage ? (
-                          <LiquidLayer ref={liquidRef} width={frame.width} height={frame.height} phone={phone} listening={liquidListen} onFree={setLiquidFree} />
+                          <LiquidLayer
+                            ref={liquidRef}
+                            width={frame.width}
+                            height={frame.height}
+                            phone={phone}
+                            listening={liquidListen}
+                            hold={dotStudio}
+                            ranges={
+                              rangeDraft && rangeGesture !== "new" && rangeDraft.id != null
+                                ? liquidRanges.map((range) => (range.id === rangeDraft.id ? { ...rangeDraft, id: range.id } : range))
+                                : liquidRanges
+                            }
+                            hides={
+                              hideDraft && rangeGesture !== "new" && hideDraft.id != null
+                                ? liquidHides.map((hide) => (hide.id === hideDraft.id ? { ...hideDraft, id: hide.id, shape: hide.shape } : hide))
+                                : hideDraft && rangeGesture === "new"
+                                  ? [...liquidHides, hideDraft]
+                                  : liquidHides
+                            }
+                            onFree={setLiquidFree}
+                          />
+                        ) : null}
+                        {!phone && liquidRangeMode && liquidImage && (item?.id ?? null) === puruItemId ? (
+                          <div
+                            className="liquid-range-pick"
+                            aria-label="発射範囲をドラッグで指定"
+                            onPointerDown={onRangeDown}
+                            onPointerMove={onRangeMove}
+                            onPointerUp={onRangeUp}
+                            onPointerCancel={onRangeUp}
+                          >
+                            <div ref={rangePlaneRef} className="liquid-range-plane" data-range-plane>
+                              {liquidRanges.map((range) => {
+                                const shown =
+                                  rangeDraft && rangeGesture !== "new" && range.id != null && range.id === rangeDraft.id
+                                    ? { ...rangeDraft, id: range.id }
+                                    : range;
+                                return (
+                                  <LiquidRangeFace
+                                    key={`range-${range.id ?? `${range.x}-${range.y}`}`}
+                                    range={shown}
+                                    editing={liquidPick?.kind === "range" && range.id === liquidPick.id}
+                                    aspect={frame.height > 0 ? frame.width / frame.height : 1}
+                                    insetU={frame.width > 0 ? 26 / frame.width : 0.03}
+                                    insetV={frame.height > 0 ? 26 / frame.height : 0.03}
+                                  />
+                                );
+                              })}
+                              {liquidHides.map((hide) => {
+                                const shown =
+                                  hideDraft && rangeGesture !== "new" && hide.id != null && hide.id === hideDraft.id
+                                    ? { ...hideDraft, id: hide.id, shape: hide.shape }
+                                    : hide;
+                                return (
+                                  <LiquidRangeFace
+                                    key={`hide-${hide.id ?? `${hide.x}-${hide.y}`}`}
+                                    range={shown}
+                                    editing={liquidPick?.kind === "hide" && hide.id === liquidPick.id}
+                                    aspect={frame.height > 0 ? frame.width / frame.height : 1}
+                                    shape={shown.shape}
+                                    tone="hide"
+                                    insetU={frame.width > 0 ? 26 / frame.width : 0.03}
+                                    insetV={frame.height > 0 ? 26 / frame.height : 0.03}
+                                  />
+                                );
+                              })}
+                              {rangeGesture === "new" && rangeDraft ? (
+                                <LiquidRangeFace
+                                  range={rangeDraft}
+                                  editing={false}
+                                  aspect={frame.height > 0 ? frame.width / frame.height : 1}
+                                  insetU={frame.width > 0 ? 26 / frame.width : 0.03}
+                                  insetV={frame.height > 0 ? 26 / frame.height : 0.03}
+                                />
+                              ) : null}
+                              {rangeGesture === "new" && hideDraft ? (
+                                <LiquidRangeFace
+                                  range={hideDraft}
+                                  editing={false}
+                                  aspect={frame.height > 0 ? frame.width / frame.height : 1}
+                                  shape={hideDraft.shape}
+                                  tone="hide"
+                                  insetU={frame.width > 0 ? 26 / frame.width : 0.03}
+                                  insetV={frame.height > 0 ? 26 / frame.height : 0.03}
+                                />
+                              ) : null}
+                              <p className="liquid-range-hint">
+                                {rangeGesture === "new"
+                                  ? rangeTool === "circle"
+                                    ? "ドラッグで円の非表示を指定"
+                                    : rangeTool === "rect"
+                                      ? "ドラッグで四角の非表示を指定"
+                                      : "ドラッグで発射範囲を指定"
+                                  : liquidRanges.length > 0 || liquidHides.length > 0
+                                    ? liquidPick?.kind === "hide" || liquidRanges.length === 0
+                                      ? "□で移動、〇で大きさ、◇で角度、半円で傾斜"
+                                      : "□で移動、〇で角、◇で面、半円で回転"
+                                    : rangeTool === "circle"
+                                      ? "ドラッグで円の非表示を指定"
+                                      : rangeTool === "rect"
+                                        ? "ドラッグで四角の非表示を指定"
+                                        : "ドラッグで発射範囲を指定"}
+                              </p>
+                            </div>
+                          </div>
                         ) : null}
                       </>,
                       true,
                     )
                   ) : (
-                    <img ref={bindMedia} src={url} alt={item.name} draggable={!phone && item.mime.startsWith("image/")} />
+                    <img ref={bindMedia} className={pixelView ? "is-pixel-view" : undefined} src={url} alt={item.name} draggable={!phone && item.mime.startsWith("image/")} />
                   )
                 ) : (
                   <p className="text-sm text-paper">{failed ? "プレビューを開けませんでした。" : "読み込み中"}</p>
@@ -3662,7 +6235,7 @@ export function Lightbox({
                       />,
                     )
                   : null}
-                {motionOn && frame ? <div className="lightbox-gesture" style={{ left: frame.left, top: frame.top, width: frame.width, height: frame.height }} /> : null}
+                {motionOn && frame ? <div className={liquidRangeMode ? "lightbox-gesture is-passing" : "lightbox-gesture"} style={{ left: frame.left, top: frame.top, width: frame.width, height: frame.height }} /> : null}
                 {puruEdit && puruAvailable && frame ? (
                   <div
                     className="puru-edit"
@@ -3687,7 +6260,7 @@ export function Lightbox({
                         return (
                           <div
                             key={marker.id}
-                            className={["puru-marker", marker.id === puruSelected ? "is-selected" : "", still ? "is-still" : ""].filter(Boolean).join(" ")}
+                            className={["puru-marker", marker.id === puruSelected ? "is-selected" : "", still ? "is-still" : "", marker.off ? "is-off" : ""].filter(Boolean).join(" ")}
                             style={{
                               left: `${marker.u * 100}%`,
                               top: `${marker.v * 100}%`,
@@ -3719,7 +6292,7 @@ export function Lightbox({
                     </div>
                   </div>
                 ) : null}
-                {frame && !editing && !markerMode ? (
+                {frame && !editing && !markerMode && !liquidRangeMode && !dotStudio ? (
                   <div className="lightbox-hit" style={{ left: frame.left, top: frame.top, width: frame.width, height: frame.height }}>
                     <button
                       type="button"
@@ -3750,6 +6323,46 @@ export function Lightbox({
                       </span>
                     </button>
                   </div>
+                ) : null}
+                {dotStudio && !phone && item ? (
+                  <>
+                    <DotMarkerList
+                      markers={dotRecipeLive.markers}
+                      selectedId={dotPick}
+                      editing={dotEdit}
+                      placing={dotPlace}
+                      onPlace={setDotPlace}
+                      onSelect={setDotPick}
+                      onEdit={(id) => {
+                        if (!id) {
+                          setDotEdit(false);
+                          return;
+                        }
+                        setDotPick(id);
+                        setDotEdit(true);
+                      }}
+                      onChange={(markers) => {
+                        if (dotPick && !markers.some((marker) => marker.id === dotPick)) {
+                          setDotPick(null);
+                          setDotEdit(false);
+                        }
+                        void setImageDot(item.id, { markers });
+                      }}
+                    />
+                    <DotPreview
+                      sourceRef={mediaRef}
+                      cols={dotMosaic ? dotCols : null}
+                      colors={dotColorOn ? dotColors : null}
+                      recipe={dotRecipeLive}
+                      recipeKey={`${dotFancyKey}|${dotMosaic ? dotCols : 0}|${dotColorOn ? dotColors : 0}`}
+                      live={false}
+                      mosaicOn={dotMosaic}
+                      plate={dotPlate}
+                      onPlate={setDotPlate}
+                      copying={dotCopying}
+                      onCopy={copyDotStill}
+                    />
+                  </>
                 ) : null}
                 {phone && infoOpen ? (
                   <section
@@ -3784,7 +6397,8 @@ export function Lightbox({
               {phone ? (
                 <div className="lightbox-nav is-phone-dock phone-menu" onPointerDown={(event) => event.stopPropagation()}>
                   {liquidMode && liquidImage ? (
-                    <div className="phone-dock-row is-liquid" role="toolbar" aria-label="液体演出">
+                    <div className="phone-effect-dock">
+                      <div className="phone-dock-row is-liquid" role="toolbar" aria-label="液体演出">
                       <Button
                         variant="quiet"
                         className="lightbox-fav is-liquid is-on"
@@ -3837,6 +6451,7 @@ export function Lightbox({
                         </div>
                       </div>
                     </div>
+                    </div>
                   ) : phonePlay ? (
                     <div className="phone-dock-row is-anim" role="toolbar" aria-label="画像アニメーション">
                       {stopBothButton}
@@ -3864,6 +6479,19 @@ export function Lightbox({
                             <p className="lightbox-anim-title">画像アニメーション</p>
                             <button type="button" className={animLive ? "" : "is-on"} aria-pressed={!animLive} onClick={stopAnimation}>
                               停止
+                            </button>
+                            <button
+                              type="button"
+                              className={vectorPlay || effectPlay ? "is-on" : ""}
+                              aria-pressed={vectorPlay || effectPlay}
+                              aria-label={vectorPlay || effectPlay ? "マーカーを停止" : "マーカーを再生"}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                if (vectorPlay || effectPlay) stopTogether();
+                                else toggleVectorPlay();
+                              }}
+                            >
+                              {vectorPlay || effectPlay ? "■" : "マーカーを再生"}
                             </button>
                             <p className="lightbox-anim-label">横揺れ</p>
                             <div className="lightbox-anim-row">
@@ -4000,16 +6628,6 @@ export function Lightbox({
                           </div>
                         ) : null}
                       </span>
-                      <Button
-                        variant="quiet"
-                        className={normalizeImagePlay(item.play) ? "lightbox-fav is-play-saved" : "lightbox-fav"}
-                        aria-label="アニメーションと音声をお気に入り登録"
-                        aria-pressed={normalizeImagePlay(item.play) !== null}
-                        onPointerDown={(event) => event.stopPropagation()}
-                        onClick={savePlay}
-                      >
-                        <Star aria-hidden="true" fill={normalizeImagePlay(item.play) ? "currentColor" : "none"} />
-                      </Button>
                       <span className="lightbox-play-pair">
                         <Button
                           variant="quiet"
@@ -4064,15 +6682,17 @@ export function Lightbox({
                       >
                         メモ
                       </Button>
-                      <Button
-                        variant="quiet"
-                        className={item.favorite ? "lightbox-fav is-on" : "lightbox-fav"}
-                        aria-label={item.favorite ? `${item.name}のお気に入りを解除` : `${item.name}をお気に入りに追加`}
-                        aria-pressed={item.favorite}
-                        onClick={() => onToggleFavorite(item.id)}
-                      >
-                        <Heart aria-hidden="true" fill={item.favorite ? "currentColor" : "none"} />
-                      </Button>
+                      {dotImage && item ? (
+                        <DotControl
+                          mode="phone"
+                          show={dotShow}
+                          mosaic={dotMosaic}
+                          colorOn={dotColorOn}
+                          cols={dotCols}
+                          colors={dotColors}
+                          onShow={(on) => void setImageDot(item.id, { show: on })}
+                        />
+                      ) : null}
                       {liquidImage ? (
                         <Button
                           variant="quiet"
@@ -4102,7 +6722,7 @@ export function Lightbox({
                           setVoiceRateOpen(false);
                           setSensorMenu(false);
                           setShakeMenu(false);
-                          setPhonePlay(true);
+                          openPhoneAnim();
                         }}
                       >
                         <Play aria-hidden="true" fill={animLive ? "currentColor" : "none"} />
@@ -4113,6 +6733,14 @@ export function Lightbox({
                     </div>
                   )}
                 </div>
+              ) : dotStudio ? (
+                <div className="lightbox-nav is-dot-studio" onPointerDown={(event) => event.stopPropagation()}>
+                  <DotStudioBar
+                    dot={item.dot}
+                    onPatch={(patch) => void setImageDot(item.id, patch)}
+                    onClose={() => setDotStudio(false)}
+                  />
+                </div>
               ) : (
               <div className="lightbox-nav">
                 {total > 1 ? (
@@ -4122,7 +6750,20 @@ export function Lightbox({
                 ) : (
                   <span />
                 )}
-                <div className={phone ? "lightbox-nav-mid phone-menu" : "lightbox-nav-mid"}>
+                <div
+                  ref={navMidRef}
+                  className={phone ? "lightbox-nav-mid phone-menu" : dotMenu && dotAnchor > 0 ? "lightbox-nav-mid is-dot-open" : "lightbox-nav-mid"}
+                  style={
+                    !phone && dotMenu && dotAnchor > 0
+                      ? {
+                          width: dotAnchor,
+                          minWidth: dotAnchor,
+                          maxWidth: dotAnchor,
+                          ...(dotRange != null ? ({ ["--dot-range" as string]: `${dotRange}px` } as CSSProperties) : {}),
+                        }
+                      : undefined
+                  }
+                >
                   {!phone && puruEdit ? (
                     <div className="puru-kind-row" role="toolbar" aria-label="マーカーの種類">
                       {(
@@ -4183,28 +6824,12 @@ export function Lightbox({
                         disabled={!selectedMarker}
                         onClick={() => {
                           if (!selectedMarker) return;
-                          const id = selectedMarker.id;
-                          setPuruMarkers((list) => list.filter((marker) => marker.id !== id));
-                          setPuruSelected(null);
+                          removePuruMarker(selectedMarker.id);
                         }}
                       >
                         削除
                       </button>
                       <div className="puru-kind-actions">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const id = shownIdRef.current;
-                            if (!id) return;
-                            const markers = puruMarkersRef.current.map((marker) => ({ ...marker }));
-                            void saveImagePuru(id, markers).then((ok) => {
-                              if (!ok || shownIdRef.current !== id) return;
-                              setPuruNote("保存しました");
-                            });
-                          }}
-                        >
-                          {puruNote || "保存"}
-                        </button>
                         <button type="button" onClick={() => closePuru()}>
                           終了
                         </button>
@@ -4215,44 +6840,21 @@ export function Lightbox({
                     </div>
                   ) : !phone && vectorEdit ? (
                     <div className="vector-kind-row" role="toolbar" aria-label="ベクトルマーカー">
-                      {VECTOR_KINDS.map((kind) => (
-                        <div key={kind.id} className="vector-kind-group" style={{ ["--vector" as string]: kind.color }} aria-label={kind.label}>
-                          <span className="vector-kind-name">{kind.label}</span>
-                          {VECTOR_PACES.map((pace) => {
-                            const on = vectorArmed?.kind === kind.id && vectorArmed.pace === pace.id;
-                            return (
-                              <button
-                                key={pace.id}
-                                type="button"
-                                className={on ? "vector-pace is-on" : "vector-pace"}
-                                aria-pressed={on}
-                                aria-label={`${kind.label} ${pace.label}`}
-                                onPointerDown={(event) => onVectorKindDown(kind.id, pace.id, event)}
-                                onPointerMove={onVectorKindMove}
-                                onPointerUp={onVectorKindUp}
-                                onPointerCancel={onVectorKindCancel}
-                              >
-                                {pace.label}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      ))}
-                      <div className="puru-kind-actions">
+                      <div className="vector-kind-line">
+                        {VECTOR_KINDS.slice(0, vectorSecondAt).map(vectorKindGroup)}
+                      </div>
+                      <div className="vector-kind-line">
+                        {VECTOR_KINDS.slice(vectorSecondAt).map(vectorKindGroup)}
+                        <div className="puru-kind-actions">
                         <button
                           type="button"
                           disabled={vectorSelected === null}
                           onClick={() => {
-                            const id = vectorSelected;
-                            if (id === null) return;
-                            setVectorMarkers((list) => list.filter((marker) => marker.id !== id));
-                            setVectorSelected(null);
+                            if (vectorSelected === null) return;
+                            removeVectorMarker(vectorSelected);
                           }}
                         >
                           削除
-                        </button>
-                        <button type="button" onClick={saveVectors}>
-                          {vectorNote || "保存"}
                         </button>
                         <button type="button" onClick={openPuru}>
                           ぷるぷる
@@ -4261,7 +6863,10 @@ export function Lightbox({
                           終了
                         </button>
                       </div>
+                      </div>
                     </div>
+                  ) : !phone && effectEdit ? (
+                    effectKindRow
                   ) : (
                     <>
                   {phone ? null : item.animated ? (
@@ -4305,6 +6910,23 @@ export function Lightbox({
                     <Heart aria-hidden="true" fill={item.favorite ? "currentColor" : "none"} />
                   </Button>
                   )}
+                  {dotImage && item ? (
+                    <DotControl
+                      mode="pc"
+                      show={dotShow}
+                      mosaic={dotMosaic}
+                      colorOn={dotColorOn}
+                      cols={dotCols}
+                      colors={dotColors}
+                      menuOpen={dotMenu}
+                      onMenu={toggleDotMenu}
+                      onShow={(on) => void setImageDot(item.id, { show: on })}
+                      onMosaic={(on) => void setImageDot(item.id, { on })}
+                      onColor={(on) => void setImageDot(item.id, { colorOn: on })}
+                      onCols={(cols) => void setImageDot(item.id, { cols })}
+                      onColors={(colors) => void setImageDot(item.id, { colors })}
+                    />
+                  ) : null}
                   {pcTools ? (
                     <>
                     <Button
@@ -4337,6 +6959,38 @@ export function Lightbox({
                           <Droplet aria-hidden="true" fill={liquidMode ? "currentColor" : "none"} />
                         </Button>
                         {liquidMode ? (
+                          liquidRangeMode ? (
+                            <>
+                              <RangeToolButtons tool={rangeTool} onTool={setRangeTool} />
+                              <Button
+                                variant="quiet"
+                                className="liquid-reset"
+                                aria-label="選択中の発射範囲または非表示を削除"
+                                onPointerDown={(event) => event.stopPropagation()}
+                                onClick={(event) => {
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  deleteLiquidRange();
+                                }}
+                              >
+                                削除
+                              </Button>
+                              <Button
+                                variant="quiet"
+                                className="liquid-reset"
+                                aria-label="発射範囲の選択を終了"
+                                onPointerDown={(event) => event.stopPropagation()}
+                                onClick={(event) => {
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  endLiquidRange();
+                                }}
+                              >
+                                終了
+                              </Button>
+                            </>
+                          ) : (
+                            <>
                           <Button
                             variant="quiet"
                             className="liquid-reset"
@@ -4350,6 +7004,22 @@ export function Lightbox({
                           >
                             リセット
                           </Button>
+                          <Button
+                            variant="quiet"
+                            className={liquidRanges.length > 0 ? "liquid-reset is-on" : "liquid-reset"}
+                            aria-label="発射範囲"
+                            aria-pressed={liquidRanges.length > 0}
+                            onPointerDown={(event) => event.stopPropagation()}
+                            onClick={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              openLiquidRange();
+                            }}
+                          >
+                            発射範囲
+                          </Button>
+                            </>
+                          )
                         ) : null}
                       </span>
                     ) : null}
@@ -4389,16 +7059,16 @@ export function Lightbox({
                           </button>
                           <button
                             type="button"
-                            className={vectorPlay ? "is-on" : ""}
-                            aria-pressed={vectorPlay}
-                            aria-label={vectorPlay ? "マーカーを停止" : "マーカーを再生"}
+                            className={vectorPlay || effectPlay ? "is-on" : ""}
+                            aria-pressed={vectorPlay || effectPlay}
+                            aria-label={vectorPlay || effectPlay ? "マーカーを停止" : "マーカーを再生"}
                             onClick={(event) => {
                               event.stopPropagation();
-                              if (vectorPlay) stopTogether();
+                              if (vectorPlay || effectPlay) stopTogether();
                               else toggleVectorPlay();
                             }}
                           >
-                            {vectorPlay ? "■" : "マーカーを再生"}
+                            {vectorPlay || effectPlay ? "■" : "マーカーを再生"}
                           </button>
                           <p className="lightbox-anim-label">横揺れ</p>
                           <div className="lightbox-anim-row">
@@ -4600,7 +7270,7 @@ export function Lightbox({
                       onClick={(event) => {
                         event.preventDefault();
                         event.stopPropagation();
-                        if (event.detail === 3) setPcTools(true);
+                        if (event.detail === 3) openHiddenTools();
                       }}
                     />
                   )}
@@ -4633,6 +7303,19 @@ export function Lightbox({
                           <path d="M7 3.5 L6.2 8.2 L10.4 6.2 Z" fill="currentColor" />
                         </svg>
                       </Button>
+                      <Button
+                        variant="quiet"
+                        className={effectEdit || effectMarkers.length > 0 ? "lightbox-fav is-effect is-on" : "lightbox-fav is-effect"}
+                        aria-label="エフェクトマーカー"
+                        aria-pressed={effectEdit}
+                        onPointerDown={(event) => event.stopPropagation()}
+                        onClick={openEffect}
+                      >
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M12 3.5v3.2M12 17.3V20.5M3.5 12h3.2M17.3 12h3.2M6.2 6.2l2.2 2.2M15.6 15.6l2.2 2.2M17.8 6.2l-2.2 2.2M8.4 15.6l-2.2 2.2" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                          <circle cx="12" cy="12" r="2.15" fill="currentColor" />
+                        </svg>
+                      </Button>
                     </span>
                   ) : null}
                   {(phone ? phonePlay : pcTools) ? (
@@ -4640,10 +7323,10 @@ export function Lightbox({
                       <Button
                         variant="quiet"
                         className={normalizeImagePlay(item.play) ? "lightbox-fav is-play-saved" : "lightbox-fav"}
-                        aria-label="アニメーションと音声をお気に入り登録"
+                        aria-label={normalizeImagePlay(item.play) ? "アニメーションと音声のお気に入りを確認" : "アニメーションと音声をお気に入り登録"}
                         aria-pressed={normalizeImagePlay(item.play) !== null}
                         onPointerDown={(event) => event.stopPropagation()}
-                        onClick={savePlay}
+                        onClick={askFavorite}
                       >
                         <Star aria-hidden="true" fill={normalizeImagePlay(item.play) ? "currentColor" : "none"} />
                       </Button>
@@ -4701,27 +7384,12 @@ export function Lightbox({
                 <div className="puru-head">
                   <p>ぷるぷるメーカー</p>
                   <div className="puru-head-actions">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const id = shownIdRef.current;
-                        if (!id) return;
-                        const markers = puruMarkersRef.current.map((marker) => ({ ...marker }));
-                        void saveImagePuru(id, markers).then((ok) => {
-                          if (!ok || shownIdRef.current !== id) return;
-                          setPuruNote("保存しました");
-                        });
-                      }}
-                    >
-                      {puruNote || "保存"}
-                    </button>
                     {selectedMarker ? (
                       <button
                         type="button"
                         onClick={() => {
-                          const id = selectedMarker.id;
-                          setPuruMarkers((list) => list.filter((marker) => marker.id !== id));
-                          setPuruSelected(null);
+                          if (!selectedMarker) return;
+                          removePuruMarker(selectedMarker.id);
                         }}
                       >
                         削除
@@ -4856,6 +7524,187 @@ export function Lightbox({
                     );
                   })()
                 : null}
+              {effectGhost ? (
+                <div
+                  className={effectGhost.inside ? "effect-drag-ghost" : "effect-drag-ghost is-out"}
+                  style={{ left: effectGhost.x, top: effectGhost.y, width: effectGhost.w, height: effectGhost.h }}
+                >
+                  <img src={EFFECT_ASSET_URL[EFFECT_KIND_ASSETS[effectGhost.kind][0]]} alt="" draggable={false} />
+                  <span>{EFFECT_PACES.find((entry) => entry.id === effectGhost.pace)?.label}</span>
+                </div>
+              ) : null}
+        {markerSaveError ? (
+          <div className="marker-save-error" role="alert" onPointerDown={(event) => event.stopPropagation()}>
+            <p>{markerSaveError}</p>
+            <button
+              type="button"
+              onClick={() => {
+                puruSavedRef.current = "";
+                vectorSavedRef.current = "";
+                effectSavedRef.current = "";
+                flushPuru();
+                flushVectors();
+                flushEffects();
+              }}
+            >
+              再試行
+            </button>
+          </div>
+        ) : null}
+        {playAsk ? (
+          <div
+            className="media-gate"
+            onPointerDown={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              cancelFavorite();
+            }}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+            }}
+          >
+            <div
+              className="media-gate-card"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="play-ask-title"
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <h2 id="play-ask-title">{playAskSaved ? "お気に入り" : "お気に入り登録"}</h2>
+              {playAskSaved ? <p className="media-gate-note">登録済みです。「登録」で今の内容に更新し、「登録を解除する」で外します。</p> : null}
+              {playAskSaved
+                ? null
+                : playAsk.lines.map((line, index) => (
+                    <p key={`${index}-${line}`} className="media-gate-note">
+                      {line}
+                    </p>
+                  ))}
+              {playAsk.names.map((name, index) => (
+                <p key={`${index}-${name}`} className="play-ask-name">
+                  {name}
+                </p>
+              ))}
+              <div className="media-gate-actions">
+                <button type="button" onClick={cancelFavorite}>
+                  キャンセル
+                </button>
+                <button type="button" className="is-solid" onClick={confirmFavorite}>
+                  {playAskSaved ? "登録" : "登録する"}
+                </button>
+                {playAskSaved && !phone ? (
+                  <span className="gif-frame-count" role="radiogroup" aria-label="GIFのフレーム数">
+                    {GIF_EXPORT_COUNTS.map((count) => (
+                      <button
+                        key={count}
+                        type="button"
+                        role="radio"
+                        aria-checked={gifFrames === count}
+                        className={gifFrames === count ? "is-on" : ""}
+                        onClick={() => setGifFrames(count)}
+                      >
+                        {count}
+                      </button>
+                    ))}
+                  </span>
+                ) : null}
+                {playAskSaved && !phone ? (
+                  <label className={gifDotByDot ? "gif-dot-out is-on" : "gif-dot-out"}>
+                    <input
+                      type="checkbox"
+                      checked={gifDotByDot}
+                      onChange={(event) => setGifDotByDot(event.currentTarget.checked)}
+                    />
+                    ドットバイドットで出力
+                  </label>
+                ) : null}
+                {playAskSaved && !phone ? (
+                  <button type="button" onClick={exportSavedGif} disabled={gifJob !== null}>
+                    お気に入りをGIF化
+                  </button>
+                ) : null}
+                {playAskSaved ? (
+                  <button type="button" onClick={clearFavorite}>
+                    登録を解除する
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        ) : null}
+        {mediaGate ? (
+          <div className="media-gate" role="status" aria-live="polite" aria-busy={mediaGate.busy} onPointerDown={(event) => event.stopPropagation()}>
+            <div className="media-gate-card">
+              <h2>{mediaGate.busy ? "読み込み中" : mediaGate.title}</h2>
+              {mediaGate.busy ? <p className="media-gate-note">{mediaGate.title}</p> : null}
+              {mediaGate.note ? <p className="media-gate-note">{mediaGate.note}</p> : null}
+              <p className="media-gate-count">
+                {mediaGate.total > 0 ? `${mediaGate.done} / ${mediaGate.total}（${loadPercent(mediaGate.done, mediaGate.total)}%）` : "準備しています"}
+              </p>
+              <div
+                className={mediaGate.busy ? "media-gate-bar is-busy" : "media-gate-bar"}
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={Math.max(1, mediaGate.total)}
+                aria-valuenow={mediaGate.done}
+                aria-label="読み込みの進み具合"
+              >
+                <span style={{ width: mediaGate.total > 0 ? `${(mediaGate.done / mediaGate.total) * 100}%` : "0%" }} />
+              </div>
+              {mediaGate.busy && mediaGate.active.length > 0 ? (
+                <ul className="media-gate-active">
+                  {mediaGate.active.map((item) => (
+                    <li key={item.id}>{`${item.id}（${item.stage}）`}</li>
+                  ))}
+                </ul>
+              ) : null}
+              {mediaGate.failed.length > 0 ? (
+                <ul className="media-gate-failed">
+                  {mediaGate.failed.map((name) => (
+                    <li key={name}>{failureLabel(name)}</li>
+                  ))}
+                </ul>
+              ) : null}
+              <div className="media-gate-actions">
+                {mediaGate.busy ? (
+                  <button type="button" onClick={() => gateCancelRef.current?.()}>
+                    キャンセル
+                  </button>
+                ) : (
+                  <>
+                    <button type="button" className="is-solid" onClick={() => gateRetryRef.current?.()}>
+                      再試行
+                    </button>
+                    <button type="button" onClick={() => gateProceedRef.current?.()}>
+                      このまま使う
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : null}
+        {gifJob && !phone ? (
+          <div className="gif-job" role="status" aria-live="polite" onPointerDown={(event) => event.stopPropagation()}>
+            <p className="gif-job-stage">{gifJob.stage}</p>
+            <p className="gif-job-percent">{gifJob.percent}%</p>
+            <div className="gif-job-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={gifJob.percent} aria-label="GIFの進み具合">
+              <span style={{ width: `${gifJob.percent}%` }} />
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                gifAbort.current?.abort();
+              }}
+            >
+              キャンセル
+            </button>
+          </div>
+        ) : null}
+        {frameListRef.current && item ? (
+          <GifFrameList itemId={item.id} name={item.name} onBack={() => setFrameFor(null)} bindBack={bindFrameBack} />
+        ) : null}
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>

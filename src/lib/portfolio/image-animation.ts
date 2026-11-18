@@ -26,10 +26,8 @@ export const TWIST_DEG = 15;
 type Pace = { time: number; travel: number };
 
 /**
- * Horizontal and vertical sway, and the circle, step up one preset.
- * slow uses the old normal clock, and each faster name takes the clock that used to sit above it.
- * The new ultra is the speed halfway between rapid and the previous ultra. Travel stays put, so only the clock changes.
- * Zoom and buzz are not part of this shift. Ultra hit uses its own contact clock.
+ * Travel only. Sway, hit, and orbit no longer read `time` for the clock.
+ * Zoom still does. Twist's normal clock reads sway's slow `time`, which stays 1.
  */
 const SWAY: Record<AnimSpeed, Pace> = {
   slow: { time: 1, travel: 1 },
@@ -43,7 +41,6 @@ const HIT: Record<AnimSpeed, Pace> = {
   normal: { time: 0.64, travel: 1.08 },
   fast: { time: 0.36, travel: 1.32 },
   rapid: { time: 0.2, travel: 1.45 },
-  // Travel only. The ultra clock is ULTRA_HIT_CONTACT, so the impact stays readable.
   ultra: { time: 0.08, travel: 1.45 },
 };
 const ORBIT: Record<AnimSpeed, Pace> = {
@@ -61,47 +58,83 @@ const ZOOM: Record<AnimSpeed, Pace> = {
   ultra: { time: 0.13, travel: 1.38 },
 };
 
-const BUZZ: Record<AnimSpeed, { still: number; buzz: number; freq: number; amp: number }> = {
-  slow: { still: 1700, buzz: 360, freq: 12, amp: 2.4 },
-  normal: { still: 1100, buzz: 280, freq: 18, amp: 3.1 },
-  fast: { still: 680, buzz: 210, freq: 22, amp: 3.3 },
-  rapid: { still: 320, buzz: 150, freq: 26, amp: 4.2 },
-  ultra: { still: 130, buzz: 110, freq: 30, amp: 5.2 },
+const BUZZ_LOOPS: Record<AnimSpeed, number> = { slow: 3, normal: 4, fast: 6, rapid: 12, ultra: 20 };
+/** Rest versus buzz, taken from the previous 1700/360, 1100/280, 680/210, 320/150, 130/110 split. */
+const BUZZ_STILL_SHARE: Record<AnimSpeed, number> = {
+  slow: 1700 / 2060,
+  normal: 1100 / 1380,
+  fast: 680 / 890,
+  rapid: 320 / 470,
+  ultra: 130 / 240,
 };
+const BUZZ_TONE: Record<AnimSpeed, { freq: number; amp: number }> = {
+  slow: { freq: 12, amp: 2.4 },
+  normal: { freq: 18, amp: 3.1 },
+  fast: { freq: 22, amp: 3.3 },
+  rapid: { freq: 26, amp: 4.2 },
+  ultra: { freq: 30, amp: 5.2 },
+};
+/** How many zoom loops fit in two 打ち付け・遅 loops. Travel stays on the ZOOM table. */
+const ZOOM_LOOPS: Record<AnimSpeed, number> = { slow: 1, normal: 2, fast: 4, rapid: 8, ultra: 16 };
 
 /**
- * Ultra hit only. Milliseconds, not a scaled copy of the slower curve.
- * Pull and slam stay short. The stop and the ring keep enough time to see.
+ * Vector「打ち付け・遅」is 2560ms (1280 × 2). Image「普通」uses that as T.
+ * The names below are speed multipliers, not time multipliers.
+ * One loop is T divided by the multiplier, so a slower name takes longer.
+ * 高速 is 3, the integer between 速い (2) and 超高速 (4), so six loops fit in two 打ち付け・遅 loops.
  */
-export const ULTRA_HIT_CONTACT = { pull: 72, slam: 44, stop: 84, buzz: 192 } as const;
+const HIT_SLOW_MS = 2560;
+/** Two loops of 打ち付け・遅. Same window as favoriteRecordMs. */
+const IMAGE_RECORD_MS = HIT_SLOW_MS * 2;
+const IMAGE_SPEED: Record<AnimSpeed, number> = {
+  slow: 0.5,
+  normal: 1,
+  fast: 2,
+  rapid: 3,
+  ultra: 4,
+};
 
-const ULTRA_HIT_CYCLE =
-  ULTRA_HIT_CONTACT.pull + ULTRA_HIT_CONTACT.slam + ULTRA_HIT_CONTACT.stop + ULTRA_HIT_CONTACT.buzz;
-
-function paceOf(kind: AnimKind, speed: AnimSpeed): Pace {
-  if (kind === "hitX" || kind === "hitY") return HIT[speed];
-  if (kind === "orbit") return ORBIT[speed];
-  if (kind === "zoom") return ZOOM[speed];
-  return SWAY[speed];
+function sharedImageCycle(speed: AnimSpeed): number {
+  return HIT_SLOW_MS / IMAGE_SPEED[speed];
 }
 
-/** One loop, in milliseconds. Faster steps are not one shared ratio. */
+/**
+ * Ultra hit keeps its old pull / slam / stop / ring shape.
+ * The pieces are fractions of the shared ultra loop, so only the clock changes.
+ */
+const ULTRA_HIT_SHARE = { pull: 72, slam: 44, stop: 84, buzz: 192 } as const;
+const ULTRA_HIT_SHARE_SUM = ULTRA_HIT_SHARE.pull + ULTRA_HIT_SHARE.slam + ULTRA_HIT_SHARE.stop + ULTRA_HIT_SHARE.buzz;
+
+function ultraHitContact(cycle: number) {
+  const pull = (ULTRA_HIT_SHARE.pull / ULTRA_HIT_SHARE_SUM) * cycle;
+  const slam = (ULTRA_HIT_SHARE.slam / ULTRA_HIT_SHARE_SUM) * cycle;
+  const stop = (ULTRA_HIT_SHARE.stop / ULTRA_HIT_SHARE_SUM) * cycle;
+  return { pull, slam, stop, buzz: cycle - pull - slam - stop };
+}
+
+export const ULTRA_HIT_CONTACT = ultraHitContact(sharedImageCycle("ultra"));
+const ULTRA_HIT_CYCLE = ULTRA_HIT_CONTACT.pull + ULTRA_HIT_CONTACT.slam + ULTRA_HIT_CONTACT.stop + ULTRA_HIT_CONTACT.buzz;
+
+/** One loop, in milliseconds. Sway, hit, and orbit share a clock. Zoom and buzz use the record window. */
 export function animationCycle(kind: AnimKind, speed: AnimSpeed): number {
-  if (kind === "buzz") {
-    const buzz = BUZZ[speed];
-    return buzz.still + buzz.buzz;
-  }
-  if ((kind === "hitX" || kind === "hitY") && speed === "ultra") return ULTRA_HIT_CYCLE;
-  const pace = paceOf(kind, speed);
-  if (kind === "swayX" || kind === "swayY") return 3400 * pace.time;
-  if (kind === "hitX" || kind === "hitY") return 2800 * pace.time;
-  if (kind === "orbit") return 7600 * pace.time;
-  return 5200 * pace.time;
+  if (kind === "buzz") return IMAGE_RECORD_MS / BUZZ_LOOPS[speed];
+  if (kind === "swayX" || kind === "swayY" || kind === "hitX" || kind === "hitY" || kind === "orbit") return sharedImageCycle(speed);
+  return IMAGE_RECORD_MS / ZOOM_LOOPS[speed];
 }
 
 export function buzzWindow(speed: AnimSpeed): { still: number; buzz: number } {
-  const buzz = BUZZ[speed];
-  return { still: buzz.still, buzz: buzz.buzz };
+  const cycle = IMAGE_RECORD_MS / BUZZ_LOOPS[speed];
+  const still = cycle * BUZZ_STILL_SHARE[speed];
+  return { still, buzz: cycle - still };
+}
+
+/** 0 at both ends of the buzz, so the pose matches the still seam. */
+function buzzEnvelope(u: number): number {
+  if (!(u > 0) || u >= 1) return 0;
+  const edge = 0.12;
+  if (u < edge) return u / edge;
+  if (u > 1 - edge) return (1 - u) / edge;
+  return 1;
 }
 
 /**
@@ -124,14 +157,17 @@ export function hitUnit(phase: number): number {
   return 1;
 }
 
-/** Around the wall, after the stop. 30Hz with a quarter-turn so a 60fps frame lands on a peak, not a zero. */
+/** Same waves as the old 30Hz / 18Hz ring over a 192ms buzz. A longer loop does not add extra wiggles. */
 function ultraHitRing(intoMs: number): { along: number; across: number } {
-  const u = Math.min(1, Math.max(0, intoMs / ULTRA_HIT_CONTACT.buzz));
+  const buzz = ULTRA_HIT_CONTACT.buzz;
+  const u = Math.min(1, Math.max(0, intoMs / buzz));
   const decay = (1 - u) ** 1.5;
   const sec = intoMs / 1000;
+  const alongHz = (30 * ULTRA_HIT_SHARE.buzz) / buzz;
+  const acrossHz = (18 * ULTRA_HIT_SHARE.buzz) / buzz;
   return {
-    along: Math.cos(sec * 30 * Math.PI * 2) * 0.2 * decay,
-    across: Math.cos(sec * 18 * Math.PI * 2) * 0.08 * decay,
+    along: Math.cos(sec * alongHz * Math.PI * 2) * 0.2 * decay,
+    across: Math.cos(sec * acrossHz * Math.PI * 2) * 0.08 * decay,
   };
 }
 
@@ -221,23 +257,26 @@ export function animationPose(
     return { x: 0, y: 0, scale: 1 + depth * (reverse ? 1 - wave : wave) };
   }
 
-  const buzz = BUZZ[speed];
+  const span = buzzWindow(speed);
+  const tone = BUZZ_TONE[speed];
   const local = phase * cycle;
-  if (local < buzz.still) return { x: 0, y: 0, scale: 1 };
-  const into = (local - buzz.still) / 1000;
-  const amp = Math.min(buzz.amp, min * 0.02);
+  if (local < span.still || !(span.buzz > 0)) return { x: 0, y: 0, scale: 1 };
+  const along = (local - span.still) / span.buzz;
+  const env = buzzEnvelope(along);
+  const into = (local - span.still) / 1000;
+  const amp = Math.min(tone.amp, min * 0.02) * env;
   return {
-    x: Math.sin(into * buzz.freq * Math.PI * 2) * amp * dir,
-    y: Math.sin(into * buzz.freq * 1.37 * Math.PI * 2) * amp * 0.7,
-    scale: 1.03,
+    x: Math.sin(into * tone.freq * Math.PI * 2) * amp * dir,
+    y: Math.sin(into * tone.freq * 1.37 * Math.PI * 2) * amp * 0.7,
+    scale: 1 + 0.03 * env,
   };
 }
 
-/** Twist's「普通」is the old fixed clock.「遅」is twice as long,「速」is half. The base speed menu does not change it. */
+/** Twist's「普通」is half the record window.「遅」is the whole window,「速」is a quarter. The 2× / ½ steps stay. */
 const OPTION_PACE: Record<OptionPace, number> = { slow: 2, normal: 1, fast: 0.5 };
 
 export function twistCycle(pace: OptionPace = "normal"): number {
-  return 3200 * SWAY.slow.time * 4 * OPTION_PACE[pace];
+  return (IMAGE_RECORD_MS / 2) * OPTION_PACE[pace];
 }
 
 /** How far the zoom option grows past 1. Larger than the old fast zoom, still a gentle crop. */

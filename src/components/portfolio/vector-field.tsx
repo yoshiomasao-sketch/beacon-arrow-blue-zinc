@@ -18,6 +18,20 @@ type Drag =
   | { mode: "resize"; pointerId: number; id: number }
   | { mode: "angle"; pointerId: number; id: number };
 
+/** Two diameters of the marker circle. Same weight as the ring, drawn under it. */
+export function BackbeatMark({ length }: { length?: number }) {
+  return (
+    <span
+      className={length ? "marker-backbeat is-disc" : "marker-backbeat"}
+      style={length ? { width: length, height: length } : undefined}
+      aria-hidden="true"
+    >
+      <span className="marker-backbeat-line" />
+      <span className="marker-backbeat-line is-mirror" />
+    </span>
+  );
+}
+
 function Glyph({ kind }: { kind: VectorKind }) {
   if (kind === "orbit" || kind === "orbitBack") {
     const back = kind === "orbitBack";
@@ -43,11 +57,35 @@ function Glyph({ kind }: { kind: VectorKind }) {
       </svg>
     );
   }
+  if (kind === "push") {
+    return (
+      <svg viewBox="0 0 64 64" aria-hidden="true">
+        <circle cx="16" cy="32" r="4" fill="currentColor" />
+        <path d="M22 32 H44" fill="none" stroke="currentColor" strokeWidth="5" strokeLinecap="round" />
+        <path d="M40 22 L56 32 L40 42 Z" fill="currentColor" />
+      </svg>
+    );
+  }
   if (kind === "hit") {
     return (
       <svg viewBox="0 0 64 64" aria-hidden="true">
         <path d="M10 32 H42" fill="none" stroke="currentColor" strokeWidth="5" strokeLinecap="round" />
         <path d="M40 20 L58 32 L40 44 Z" fill="currentColor" />
+      </svg>
+    );
+  }
+  if (kind === "expand" || kind === "shrink") {
+    const inward = kind === "shrink";
+    const shaft = inward
+      ? "M32 14 V26 M32 50 V38 M14 32 H26 M50 32 H38"
+      : "M32 26 V12 M32 38 V52 M26 32 H12 M38 32 H52";
+    const heads = inward
+      ? "M32 30 L26 20 L38 20 Z M32 34 L26 44 L38 44 Z M30 32 L20 26 L20 38 Z M34 32 L44 26 L44 38 Z"
+      : "M32 16 L26 26 L38 26 Z M32 48 L26 38 L38 38 Z M16 32 L26 26 L26 38 Z M48 32 L38 26 L38 38 Z";
+    return (
+      <svg viewBox="0 0 64 64" aria-hidden="true">
+        <path d={shaft} fill="none" stroke="currentColor" strokeWidth="5" strokeLinecap="round" />
+        <path d={heads} fill="currentColor" />
       </svg>
     );
   }
@@ -66,6 +104,7 @@ export function VectorField({
   height,
   onSelect,
   onPatch,
+  onBackbeat,
 }: {
   markers: readonly VectorMarker[];
   selectedId: number | null;
@@ -74,8 +113,10 @@ export function VectorField({
   height: number;
   onSelect: (id: number | null) => void;
   onPatch: (id: number, patch: Partial<Pick<VectorMarker, "u" | "v" | "view" | "angle" | "span">>) => void;
+  onBackbeat: (id: number) => void;
 }) {
   const dragRef = useRef<Drag | null>(null);
+  const tapRef = useRef<{ id: number; at: number; x: number; y: number } | null>(null);
   const markersRef = useRef(markers);
   markersRef.current = markers;
 
@@ -148,12 +189,27 @@ export function VectorField({
   const onUp = (event: ReactPointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
+    const moved = drag.mode === "move" && Math.hypot(event.clientX - drag.sx, event.clientY - drag.sy) >= 6;
+    const id = drag.id;
+    const mode = drag.mode;
     dragRef.current = null;
+    if (mode !== "move" || moved) {
+      tapRef.current = null;
+      return;
+    }
+    const now = event.timeStamp;
+    const prev = tapRef.current;
+    if (prev && prev.id === id && now - prev.at <= 450 && Math.hypot(event.clientX - prev.x, event.clientY - prev.y) <= 22) {
+      tapRef.current = null;
+      onBackbeat(id);
+      return;
+    }
+    tapRef.current = { id, at: now, x: event.clientX, y: event.clientY };
   };
 
   return (
     <div
-      className="vector-field"
+      className={interactive ? "vector-field is-editing" : "vector-field"}
       style={{ pointerEvents: interactive ? "auto" : "none" }}
       onPointerDown={interactive ? onDown : undefined}
       onPointerMove={interactive ? onMove : undefined}
@@ -171,10 +227,11 @@ export function VectorField({
         return (
           <div
             key={marker.id}
-            className={selected ? "vector-marker is-selected" : "vector-marker"}
+            className={["vector-marker", selected ? "is-selected" : "", marker.off ? "is-off" : ""].filter(Boolean).join(" ")}
             data-vector-kind={marker.kind}
             data-vector-pace={marker.pace}
             data-vector-span={vectorSpan(marker)}
+            data-backbeat={marker.backbeat ? "1" : "0"}
             style={{
               left: `${marker.u * 100}%`,
               top: `${marker.v * 100}%`,
@@ -192,6 +249,7 @@ export function VectorField({
                 background: vectorHalo(face.color),
               }}
             />
+            {interactive && marker.backbeat ? <BackbeatMark /> : null}
             <span className="vector-ring" />
             <span
               className="vector-glyph"
